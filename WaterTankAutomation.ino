@@ -10,6 +10,7 @@
 #define RELAY_PIN 14      // D5
 #define LED_PIN 2         // D4 (Built-in LED, active low)
 
+
 // EEPROM Addresses
 #define EEPROM_SIZE 256
 #define WIFI_SSID_ADDR 100
@@ -34,101 +35,16 @@ bool apMode = false;
 bool mqttConfigured = false;
 bool mqttSkipped = false;
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String message;
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-
-  if (String(topic) == "waterpump/override") {
-    if (message == "ON") {
-      overrideMode = true;
-      overrideState = true;
-      digitalWrite(RELAY_PIN, LOW);
-    } else if (message == "OFF") {
-      overrideMode = true;
-      overrideState = false;
-      digitalWrite(RELAY_PIN, HIGH);
-    } else if (message == "AUTO") {
-      overrideMode = false;
-    }
-  }
-}
-
-void reconnectMQTT() {
- int attempt = 0;
-  while (!client.connected() && mqttConfigured && !mqttSkipped && attempt < 5) {
-    Serial.print("Attempting MQTT connection... (Attempt ");
-    Serial.print(attempt + 1);
-    Serial.println("/5)");
-
-    if (client.connect("ESP8266Client", mqtt_user, mqtt_password)) {
-      Serial.println("✅ MQTT Connected!");
-      client.subscribe("waterpump/override");
-      return;  // Exit function if connected
-    } else {
-      Serial.print("❌ Failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" -> Retrying in 5 seconds...");
-      delay(5000);
-      attempt++;
-    }
-  }
-
-  if (attempt == 5) {
-    mqttSkipped = true;
-    Serial.println("⚠️ MQTT connection failed after 5 attempts, skipping...");
-  }
- 
-}
-
-void loadConfig() {
-  EEPROM.begin(EEPROM_SIZE);
-
-  EEPROM.get(WIFI_SSID_ADDR, wifi_ssid);
-  EEPROM.get(WIFI_PASS_ADDR, wifi_password);
-  EEPROM.get(MQTT_ADDR, mqtt_server);
-  EEPROM.get(MQTT_ADDR + 40, mqtt_user);
-  EEPROM.get(MQTT_ADDR + 60, mqtt_password);
-  EEPROM.get(MQTT_ADDR + 80, mqtt_port);
-
-  wifi_ssid[sizeof(wifi_ssid) - 1] = '\0';
-  wifi_password[sizeof(wifi_password) - 1] = '\0';
-  mqtt_server[sizeof(mqtt_server) - 1] = '\0';
-  mqtt_user[sizeof(mqtt_user) - 1] = '\0';
-  mqtt_password[sizeof(mqtt_password) - 1] = '\0';
-
-  if (strlen(mqtt_server) > 0) {
-    mqttConfigured = true;
-  }
-
-  EEPROM.end();
-}
-
-void saveConfig() {
-  EEPROM.begin(EEPROM_SIZE);
-  
-  EEPROM.put(WIFI_SSID_ADDR, wifi_ssid);
-  EEPROM.put(WIFI_PASS_ADDR, wifi_password);
-  EEPROM.put(MQTT_ADDR, mqtt_server);
-  EEPROM.put(MQTT_ADDR + 40, mqtt_user);
-  EEPROM.put(MQTT_ADDR + 60, mqtt_password);
-  EEPROM.put(MQTT_ADDR + 80, mqtt_port);
-
-  EEPROM.commit();
-  EEPROM.end();
-}
-
 void setup() {
   Serial.begin(115200);
+  
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
   pinMode(LOW_SENSOR_PIN, INPUT);
   pinMode(HIGH_SENSOR_PIN, INPUT);
-  //pinMode(LOW_SENSOR_PIN, INPUT_PULLUP);
-  //pinMode(HIGH_SENSOR_PIN, INPUT_PULLUP);
-  pinMode(RELAY_PIN, OUTPUT);
+  
   pinMode(LED_PIN, OUTPUT);
-
-  digitalWrite(RELAY_PIN, HIGH);
   digitalWrite(LED_PIN, HIGH);
   
   loadConfig();
@@ -166,7 +82,7 @@ void loop() {
   handleLED();
   handlePumpLogic();
   Serial.print("Pump State : ");
-  Serial.println(String(digitalRead(RELAY_PIN) == LOW ? "ON" : "OFF"));
+  Serial.println(String(digitalRead(RELAY_PIN) == HIGH ? "ON" : "OFF"));
   delay(1000);
 }
 
@@ -185,9 +101,9 @@ void setupWebServer() {
                   "<table border='1'><tr><th>Item</th><th>Status</th></tr>"
                   "<tr><td>WiFi Connected</td><td>" + String(WiFi.status() == WL_CONNECTED ? "Yes" : "No") + "</td></tr>"
                   "<tr><td>MQTT Connected</td><td>" + String(client.connected() ? "Yes" : "No") + "</td></tr>"
-                  "<tr><td>Low Sensor</td><td>" + String(digitalRead(LOW_SENSOR_PIN) == LOW ? "Active" : "Inactive") + "</td></tr>"
-                  "<tr><td>High Sensor</td><td>" + String(digitalRead(HIGH_SENSOR_PIN) == LOW ? "Active" : "Inactive") + "</td></tr>"
-                  "<tr><td>Pump Status</td><td>" + String(digitalRead(RELAY_PIN) == LOW ? "ON" : "OFF") + "</td></tr>"
+                  "<tr><td>Low Sensor</td><td>" + String(digitalRead(LOW_SENSOR_PIN) == HIGH ? "Active" : "Inactive") + "</td></tr>"
+                  "<tr><td>High Sensor</td><td>" + String(digitalRead(HIGH_SENSOR_PIN) == HIGH ? "Active" : "Inactive") + "</td></tr>"
+                  "<tr><td>Pump Status</td><td>" + String(digitalRead(RELAY_PIN) == LOW ? "OFF" : "ON") + "</td></tr>"
                   "</table></body></html>";
     server.send(200, "text/html", html);
   });
@@ -231,36 +147,44 @@ void setupWebServer() {
   });
 }
 
+bool readSensor(int pin) {
+  int activeCount = 0;
+  for (int i = 0; i < 5; i++) {  // Read 5 times to filter noise
+    if (digitalRead(pin) == HIGH) { // HIGH means submerged (water detected)
+      activeCount++;
+    }
+    delay(10);  // Short delay between readings
+  }
+  return activeCount >= 3; // Return true if majority of readings are HIGH
+}
+
 void handlePumpLogic() {
-  bool lowSensor = digitalRead(LOW_SENSOR_PIN) == LOW;  // LOW = submerged (water detected)
-  bool highSensor = digitalRead(HIGH_SENSOR_PIN) == LOW; // LOW = submerged (water detected)
+  bool lowSensor = readSensor(LOW_SENSOR_PIN);  // HIGH = WET, LOW = DRY
+  bool highSensor = readSensor(HIGH_SENSOR_PIN);
+
+  Serial.print("Low Sensor: "); Serial.print(lowSensor ? "WET" : "DRY");
+  Serial.print(" | High Sensor: "); Serial.println(highSensor ? "WET" : "DRY");
 
   if (!overrideMode) {
     if (highSensor) {  
-      // 🛑 High sensor detects water → Stop pump immediately
-      digitalWrite(RELAY_PIN, HIGH);
-      Serial.println("✅ High level detected, turning OFF pump.");
+      // 🛑 HIGH sensor detects water → Turn OFF the pump
+      digitalWrite(RELAY_PIN, LOW);
+      Serial.println("✅ High sensor WET, turning OFF pump.");
     } 
     else if (!lowSensor && !highSensor) {  
-      // 🚨 Both sensors are DRY → Tank is EMPTY → Start pump
-      digitalWrite(RELAY_PIN, LOW);
-      Serial.println("⚠️ Tank is EMPTY, turning ON pump!");
-    }
-    else if (!lowSensor) {  
-      // 🔄 Low sensor is DRY but high sensor is still dry → Keep pump ON
-      digitalWrite(RELAY_PIN, LOW);
-      Serial.println("⬆️ Low sensor dry, keeping pump ON until high sensor is wet.");
-    }
+      // 🚨 Both sensors are DRY (Tank empty) → Turn ON the pump
+      digitalWrite(RELAY_PIN, HIGH);
+      Serial.println("⚠️ Tank is EMPTY (both sensors dry), turning ON pump!");
+    } 
     else {
-      // 🟢 Low sensor is WET but high sensor is still dry → Do nothing (keep previous pump state)
-      Serial.println("🟡 Low sensor wet, no change to pump.");
+      // 🟢 If high sensor is DRY but low sensor is WET → Do nothing (keep current pump state)
+      Serial.println("🟡 High sensor dry, Low sensor wet → No change to pump.");
     }
   } else {
     // Manual Override Mode
     digitalWrite(RELAY_PIN, overrideState ? LOW : HIGH);
   }
 }
-
 
 void handleLED() {
   if (WiFi.status() == WL_CONNECTED) {
@@ -275,4 +199,89 @@ void handleLED() {
       digitalWrite(LED_PIN, ledState ? HIGH : LOW);
     }
   }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+
+  if (String(topic) == "waterpump/override") {
+    if (message == "ON") {
+      overrideMode = true;
+      overrideState = true;
+      digitalWrite(RELAY_PIN, LOW);
+    } else if (message == "OFF") {
+      overrideMode = true;
+      overrideState = false;
+      digitalWrite(RELAY_PIN, HIGH);
+    } else if (message == "AUTO") {
+      overrideMode = false;
+    }
+  }
+}
+
+void reconnectMQTT() {
+ int attempt = 0;
+  while (!client.connected() && mqttConfigured && !mqttSkipped && attempt < 2) {
+    Serial.print("Attempting MQTT connection... (Attempt ");
+    Serial.print(attempt + 1);
+    Serial.println("/2)");
+
+    if (client.connect("ESP8266Client", mqtt_user, mqtt_password)) {
+      Serial.println("✅ MQTT Connected!");
+      client.subscribe("waterpump/override");
+      return;  // Exit function if connected
+    } else {
+      Serial.print("❌ Failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" -> Retrying in 2 seconds...");
+      delay(2000);
+      attempt++;
+    }
+  }
+
+  if (attempt == 2) {
+    mqttSkipped = true;
+    Serial.println("⚠️ MQTT connection failed after 2 attempts, skipping...");
+  }
+ 
+}
+
+void loadConfig() {
+  EEPROM.begin(EEPROM_SIZE);
+
+  EEPROM.get(WIFI_SSID_ADDR, wifi_ssid);
+  EEPROM.get(WIFI_PASS_ADDR, wifi_password);
+  EEPROM.get(MQTT_ADDR, mqtt_server);
+  EEPROM.get(MQTT_ADDR + 40, mqtt_user);
+  EEPROM.get(MQTT_ADDR + 60, mqtt_password);
+  EEPROM.get(MQTT_ADDR + 80, mqtt_port);
+
+  wifi_ssid[sizeof(wifi_ssid) - 1] = '\0';
+  wifi_password[sizeof(wifi_password) - 1] = '\0';
+  mqtt_server[sizeof(mqtt_server) - 1] = '\0';
+  mqtt_user[sizeof(mqtt_user) - 1] = '\0';
+  mqtt_password[sizeof(mqtt_password) - 1] = '\0';
+
+  if (strlen(mqtt_server) > 0) {
+    mqttConfigured = true;
+  }
+
+  EEPROM.end();
+}
+
+void saveConfig() {
+  EEPROM.begin(EEPROM_SIZE);
+  
+  EEPROM.put(WIFI_SSID_ADDR, wifi_ssid);
+  EEPROM.put(WIFI_PASS_ADDR, wifi_password);
+  EEPROM.put(MQTT_ADDR, mqtt_server);
+  EEPROM.put(MQTT_ADDR + 40, mqtt_user);
+  EEPROM.put(MQTT_ADDR + 60, mqtt_password);
+  EEPROM.put(MQTT_ADDR + 80, mqtt_port);
+
+  EEPROM.commit();
+  EEPROM.end();
 }
