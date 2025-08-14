@@ -5,6 +5,7 @@
 #include <ESP8266WebServer.h>
 #include <ArduinoJson.h>
 #include <ESP8266httpUpdate.h>
+#include <time.h>
 
 // =======================
 // === GPIO PIN DEFINITIONS ===
@@ -40,7 +41,7 @@ char mqtt_server[40] = "";
 char mqtt_user[20] = "";
 char mqtt_password[20] = "";
 int mqtt_port = 1883;
-char ota_password[20] = "ota_password"; // Default OTA password
+char ota_password[20] = "the_password"; // Default OTA password
 
 // ======================================
 // === ZIGBEE2MQTT SPECIFIC VARIABLES ===
@@ -65,6 +66,15 @@ bool lowSensorState = false;
 bool highSensorState = false;
 bool lastLowSensorState = false;
 bool lastHighSensorState = false;
+// Timestamps (ms since boot) for last pump ON/OFF events
+unsigned long pumpLastOnAt = 0;
+unsigned long pumpLastOffAt = 0;
+
+// Time sync (NTP) and absolute timestamps
+bool timeSyncStarted = false;
+bool timeSynced = false;
+time_t pumpLastOnEpoch = 0;  // seconds since epoch (UTC)
+time_t pumpLastOffEpoch = 0; // seconds since epoch (UTC)
 
 unsigned long lastStatusUpdate = 0;
 const long statusUpdateInterval = 10000; // Publish full state every 10 seconds
@@ -83,6 +93,9 @@ void reconnectMQTT();
 void publishState();
 void publishPumpStatus();
 void publishSensorStatus();
+void startTimeSync();
+void checkTimeSync();
+bool formatISO8601(time_t t, char* out, size_t len);
 
 // ===================
 // === SETUP FUNCTION ===
@@ -114,6 +127,7 @@ void setup() {
     Serial.println("\nAP Mode Started");
   } else {
     digitalWrite(LED_PIN, LOW); // LED ON when connected
+    startTimeSync();
   }
   
   if (mqttConfigured) {
@@ -130,6 +144,12 @@ void setup() {
 // ==================
 void loop() {
   if (!apMode && WiFi.status() == WL_CONNECTED) {
+    if (!timeSyncStarted) {
+      startTimeSync();
+    }
+    if (!timeSynced) {
+      checkTimeSync();
+    }
     if (mqttConfigured) {
       if (!client.connected()) {
         reconnectMQTT();
@@ -316,9 +336,44 @@ void handlePumpLogic() {
   // Apply pump state and check for changes
   digitalWrite(RELAY_PIN, pumpState ? HIGH : LOW);
   if (pumpState != lastPumpState) {
+    if (pumpState) {
+      pumpLastOnAt = millis();
+      if (timeSynced) {
+        pumpLastOnEpoch = time(nullptr);
+      }
+    } else {
+      pumpLastOffAt = millis();
+      if (timeSynced) {
+        pumpLastOffEpoch = time(nullptr);
+      }
+    }
     publishPumpStatus();
     lastPumpState = pumpState;
   }
+}
+
+// =====================
+// === TIME SYNC (NTP) ===
+// =====================
+void startTimeSync() {
+  if (timeSyncStarted) return;
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+  timeSyncStarted = true;
+}
+
+void checkTimeSync() {
+  time_t now = time(nullptr);
+  if (now > 1600000000) { // simple validity check (~2020-09-13)
+    timeSynced = true;
+  }
+}
+
+bool formatISO8601(time_t t, char* out, size_t len) {
+  if (t <= 0) return false;
+  struct tm* tm_info = gmtime(&t);
+  if (tm_info == nullptr) return false;
+  strftime(out, len, "%Y-%m-%dT%H:%M:%SZ", tm_info);
+  return true;
 }
 
 void handleLED() {
@@ -392,22 +447,55 @@ void reconnectMQTT() {
 }
 
 void publishState() {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<320> doc;
   
   doc["state"] = pumpState ? "ON" : "OFF";
   doc["low_sensor"] = lowSensorState;
   doc["high_sensor"] = highSensorState;
   doc["mode"] = overrideMode ? "MANUAL" : "AUTO";
+  doc["pump_last_on_ms"] = pumpLastOnAt;
+  doc["pump_last_off_ms"] = pumpLastOffAt;
+  doc["time_synced"] = timeSynced;
+  {
+    char isoOn[25];
+    char isoOff[25];
+    if (formatISO8601(pumpLastOnEpoch, isoOn, sizeof(isoOn))) {
+      doc["pump_last_on_iso"] = isoOn;
+    } else {
+      doc["pump_last_on_iso"] = nullptr;
+    }
+    if (formatISO8601(pumpLastOffEpoch, isoOff, sizeof(isoOff))) {
+      doc["pump_last_off_iso"] = isoOff;
+    } else {
+      doc["pump_last_off_iso"] = nullptr;
+    }
+  }
   
-  char buffer[256];
+  char buffer[320];
   serializeJson(doc, buffer);
   client.publish(MQTT_STATE_TOPIC, buffer);
 }
 
 void publishPumpStatus() {
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument<256> doc;
   doc["state"] = pumpState ? "ON" : "OFF";
-  char buffer[128];
+  doc["pump_last_on_ms"] = pumpLastOnAt;
+  doc["pump_last_off_ms"] = pumpLastOffAt;
+  {
+    char isoOn[25];
+    char isoOff[25];
+    if (formatISO8601(pumpLastOnEpoch, isoOn, sizeof(isoOn))) {
+      doc["pump_last_on_iso"] = isoOn;
+    } else {
+      doc["pump_last_on_iso"] = nullptr;
+    }
+    if (formatISO8601(pumpLastOffEpoch, isoOff, sizeof(isoOff))) {
+      doc["pump_last_off_iso"] = isoOff;
+    } else {
+      doc["pump_last_off_iso"] = nullptr;
+    }
+  }
+  char buffer[256];
   serializeJson(doc, buffer);
   client.publish(MQTT_STATE_TOPIC, buffer);
 }
