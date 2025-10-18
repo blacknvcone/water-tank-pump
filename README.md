@@ -6,11 +6,12 @@ An intelligent IoT-based water tank pump controller with automatic water level m
 
 - **Automatic Pump Control**: Intelligent pump control based on water level sensors with hysteresis
 - **MQTT Integration**: Full Zigbee2MQTT protocol support for home automation integration
-- **Web Interface**: Easy-to-use web interface for configuration and monitoring
+- **Web Interface**: Easy-to-use web interface for configuration and monitoring with real-time status
+- **Manual Control**: Web-based pump override buttons (ON/OFF/Auto) for instant control
 - **OTA Updates**: Over-the-air firmware updates for easy maintenance
-- **Manual Override**: Remote control via MQTT commands
-- **Time Logging**: Tracks pump on/off timestamps with NTP time synchronization
-- **Visual Feedback**: LED status indicators for system state
+- **Remote Control**: MQTT command support for home automation integration
+- **Time Logging**: Tracks pump on/off timestamps with configurable timezone (GMT+7 default)
+- **Visual Feedback**: Priority-based LED status indicators for pump and WiFi state
 - **Modular Architecture**: Clean, maintainable code structure
 
 ## Hardware Requirements
@@ -89,8 +90,21 @@ GPIO 14     D5             Relay control (pump)
 Once connected to your network, access the web interface at the device's IP address:
 
 - **Status Page**: `http://<device-ip>/`
+  - Real-time system status (WiFi, MQTT, sensors, pump)
+  - Pump timing information with timestamps
+  - Manual pump control buttons (ON/OFF/Auto)
+  - Auto-refresh every 5 seconds
+
 - **Configuration**: `http://<device-ip>/setup`
+  - WiFi settings (SSID, password)
+  - MQTT broker settings (server, port, credentials)
+  - OTA password configuration
+  - Timezone offset configuration (default: GMT+7)
+
 - **OTA Updates**: `http://<device-ip>/update`
+  - Upload new firmware (.bin files)
+  - Username: `admin`
+  - Password: configured OTA password (default: `astalavista`)
 
 ### MQTT Configuration
 
@@ -208,7 +222,21 @@ The pump operates automatically based on water level:
 
 ### Manual Override Mode
 
-Control the pump remotely via MQTT:
+#### Web Interface Control
+
+The easiest way to control the pump is via the web interface:
+
+1. Navigate to `http://<device-ip>/`
+2. Use the **Pump Control** panel at the top:
+   - **Turn Pump ON**: Forces pump to run continuously
+   - **Turn Pump OFF**: Forces pump to stop
+   - **Auto Mode**: Returns to automatic sensor-based control
+3. Current mode and pump status are displayed in real-time
+4. Page auto-refreshes every 5 seconds
+
+#### MQTT Control
+
+Control the pump remotely via MQTT commands:
 
 ```bash
 # Turn pump ON (override)
@@ -226,9 +254,18 @@ mosquitto_pub -t "zigbee2mqtt/water_tank_controller/set" \
 
 ### LED Status Indicators
 
-- **Solid ON**: Connected to WiFi, normal operation
-- **Fast Blink (200ms)**: Not connected to WiFi
-- **Slow Blink (1s)**: Manual override mode active
+The built-in LED (D4/GPIO2) provides visual feedback about the system state with priority-based patterns:
+
+| LED Pattern | Blink Speed | System State | Description |
+|-------------|-------------|--------------|-------------|
+| **Very Fast Blink** | 100ms (10 blinks/sec) | **Pump Running** | Pump is actively ON (highest priority - overrides all other states) |
+| **Very Slow Blink** | 1000ms (1 blink/sec) | **WiFi Disconnected** | Not connected to WiFi or in AP mode (when pump is OFF) |
+| **Solid ON** | No blink | **Normal Operation** | WiFi connected, pump is OFF, all systems normal |
+
+**Priority Order:**
+1. **Pump ON** always shows very fast blink, regardless of WiFi status
+2. **WiFi status** only shown when pump is OFF
+3. This makes it easy to identify pump activity at a glance
 
 ## Troubleshooting
 
