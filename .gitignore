@@ -1,0 +1,42 @@
+# PlatformIO
+.pio/
+.vscode/
+.pioenvs/
+.piolibdeps/
+.clang_complete
+.gcc-flags.json
+
+# Arduino IDE
+*.bin
+*.elf
+*.hex
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.d
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*~
+.DS_Store
+
+# OS files
+Thumbs.db
+desktop.ini
+
+# Secrets and credentials (if you create them)
+secrets.h
+credentials.h
+
+# Logs
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
