@@ -20,6 +20,9 @@
 
 // ==================== CONFIGURATION ====================
 
+// Firmware version
+#define FIRMWARE_VERSION "2.0.4"
+
 // EEPROM addresses and size
 #define EEPROM_SIZE 256
 #define WIFI_SSID_ADDR 100
@@ -36,9 +39,12 @@
 
 // MQTT topics
 #define DEVICE_ID "water_tank_controller"
-#define MQTT_STATE_TOPIC "zigbee2mqtt/" DEVICE_ID
-#define MQTT_COMMAND_TOPIC "zigbee2mqtt/" DEVICE_ID "/set"
-#define MQTT_AVAILABILITY_TOPIC "zigbee2mqtt/bridge/state"
+#define MQTT_STATE_TOPIC "watertank/" DEVICE_ID
+#define MQTT_COMMAND_TOPIC "watertank/" DEVICE_ID "/set"
+#define MQTT_AVAILABILITY_TOPIC "watertank/" DEVICE_ID "/availability"
+
+// Home Assistant MQTT Discovery
+#define HA_DISCOVERY_PREFIX "homeassistant"
 
 // ==================== SETTINGS CLASS ====================
 
@@ -114,7 +120,8 @@ void Settings::load()
 
   // Only use EEPROM password if it contains printable characters
   // Otherwise keep the default password
-  if (temp_ota_password[0] != '\0' && temp_ota_password[0] >= 32 && temp_ota_password[0] <= 126) {
+  if (temp_ota_password[0] != '\0' && temp_ota_password[0] >= 32 && temp_ota_password[0] <= 126)
+  {
     memcpy(ota_password, temp_ota_password, sizeof(ota_password));
   }
 
@@ -127,12 +134,16 @@ void Settings::load()
   bool timezone_valid = (temp_timezone >= -12 && temp_timezone <= 14);
   bool timezone_configured = timezone_valid && (temp_timezone != 0) && (temp_timezone != -1);
 
-  if (timezone_configured) {
+  if (timezone_configured)
+  {
     timezone_offset = temp_timezone;
     Serial.print("Loaded timezone from EEPROM: GMT");
-    if (temp_timezone >= 0) Serial.print("+");
+    if (temp_timezone >= 0)
+      Serial.print("+");
     Serial.println(temp_timezone);
-  } else {
+  }
+  else
+  {
     // Keep default GMT+7 and write it to EEPROM for next boot
     Serial.println("Using default timezone: GMT+7");
     EEPROM.put(TIMEZONE_ADDR, timezone_offset);
@@ -230,7 +241,7 @@ SystemManager::SystemManager() : _apMode(false),
 void SystemManager::begin()
 {
   Serial.begin(115200);
-  Serial.println("\n\nWater Tank Controller v2.0");
+  Serial.println("\n\nWater Tank Controller v" FIRMWARE_VERSION);
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH); // LED OFF (active low)
@@ -490,6 +501,7 @@ public:
   unsigned long getLastOffTime() const;
   time_t getLastOnEpoch() const;
   time_t getLastOffEpoch() const;
+  unsigned long getLastPumpDuration() const; // Last ON-to-OFF duration in milliseconds
 
   // Manual control for updating timestamps
   void updateTimestamps(time_t currentTime);
@@ -501,10 +513,11 @@ private:
   bool _lastPumpState;
 
   // Timestamps
-  unsigned long _pumpLastOnAt;  // milliseconds since boot
-  unsigned long _pumpLastOffAt; // milliseconds since boot
-  time_t _pumpLastOnEpoch;      // seconds since epoch (UTC)
-  time_t _pumpLastOffEpoch;     // seconds since epoch (UTC)
+  unsigned long _pumpLastOnAt;     // milliseconds since boot
+  unsigned long _pumpLastOffAt;    // milliseconds since boot
+  time_t _pumpLastOnEpoch;         // seconds since epoch (UTC)
+  time_t _pumpLastOffEpoch;        // seconds since epoch (UTC)
+  unsigned long _lastPumpDuration; // Last pump ON-to-OFF duration in milliseconds
 
   void setPumpState(bool state, time_t currentTime);
   void handleAutomaticControl(time_t currentTime);
@@ -517,7 +530,8 @@ PumpController::PumpController() : _overrideMode(false),
                                    _pumpLastOnAt(0),
                                    _pumpLastOffAt(0),
                                    _pumpLastOnEpoch(0),
-                                   _pumpLastOffEpoch(0)
+                                   _pumpLastOffEpoch(0),
+                                   _lastPumpDuration(0)
 {
 }
 
@@ -546,8 +560,6 @@ void PumpController::loop()
     // Automatic mode based on water level sensors
     handleAutomaticControl(currentTime);
   }
-
-  _lastPumpState = _pumpState;
 }
 
 void PumpController::setOverrideMode(bool enabled, bool state)
@@ -603,6 +615,11 @@ time_t PumpController::getLastOffEpoch() const
   return _pumpLastOffEpoch;
 }
 
+unsigned long PumpController::getLastPumpDuration() const
+{
+  return _lastPumpDuration;
+}
+
 void PumpController::updateTimestamps(time_t currentTime)
 {
   // Update epoch timestamps if time is synced and we have boot timestamps
@@ -628,6 +645,7 @@ void PumpController::setPumpState(bool state, time_t currentTime)
 {
   if (_pumpState != state)
   {
+    _lastPumpState = _pumpState; // Save old state before changing
     _pumpState = state;
     digitalWrite(RELAY_PIN, state ? HIGH : LOW);
 
@@ -649,6 +667,15 @@ void PumpController::setPumpState(bool state, time_t currentTime)
       if (currentTime > 1000000000)
       {
         _pumpLastOffEpoch = currentTime;
+      }
+
+      // Calculate pump duration (ON to OFF) in milliseconds
+      if (_pumpLastOnAt > 0 && _pumpLastOffAt > _pumpLastOnAt)
+      {
+        _lastPumpDuration = _pumpLastOffAt - _pumpLastOnAt;
+        Serial.print("Pump ran for: ");
+        Serial.print(_lastPumpDuration / 1000);
+        Serial.println(" seconds");
       }
     }
   }
@@ -700,8 +727,9 @@ public:
   // Publishing methods
   void publishState();
   void publishPumpStatus(bool pumpState, unsigned long lastOnTime, unsigned long lastOffTime,
-                         time_t lastOnEpoch, time_t lastOffEpoch);
+                         time_t lastOnEpoch, time_t lastOffEpoch, unsigned long lastDuration);
   void publishSensorStatus();
+  void publishDiscovery(); // Home Assistant MQTT Discovery
 
   // Command callback handling
   typedef std::function<void(bool overrideMode, bool overrideState)> CommandCallback;
@@ -819,8 +847,20 @@ bool MqttHandler::connect()
     Serial.print("Subscribed to: ");
     Serial.println(MQTT_COMMAND_TOPIC);
 
+    // Publish Home Assistant MQTT Discovery
+    publishDiscovery();
+
     // Publish initial state
     publishState();
+
+    // Publish initial pump status
+    publishPumpStatus(
+        pumpController.getPumpState(),
+        pumpController.getLastOnTime(),
+        pumpController.getLastOffTime(),
+        pumpController.getLastOnEpoch(),
+        pumpController.getLastOffEpoch(),
+        pumpController.getLastPumpDuration());
 
     return true;
   }
@@ -841,6 +881,9 @@ void MqttHandler::publishState()
 
   // Create JSON document
   StaticJsonDocument<512> doc;
+
+  // Add firmware version
+  doc["firmware_version"] = FIRMWARE_VERSION;
 
   // Add sensor states
   doc["contact"] = waterLevel.isLowWaterDetected();
@@ -863,7 +906,7 @@ void MqttHandler::publishState()
 }
 
 void MqttHandler::publishPumpStatus(bool pumpState, unsigned long lastOnTime, unsigned long lastOffTime,
-                                    time_t lastOnEpoch, time_t lastOffEpoch)
+                                    time_t lastOnEpoch, time_t lastOffEpoch, unsigned long lastDuration)
 {
   if (!_client.connected())
   {
@@ -897,6 +940,13 @@ void MqttHandler::publishPumpStatus(bool pumpState, unsigned long lastOnTime, un
   doc["runtime_last_on"] = lastOnTime;
   doc["runtime_last_off"] = lastOffTime;
 
+  // Add last pump duration (in seconds for readability)
+  if (lastDuration > 0)
+  {
+    doc["last_duration_seconds"] = lastDuration / 1000;
+    doc["last_duration_ms"] = lastDuration;
+  }
+
   char buffer[512];
   serializeJson(doc, buffer);
 
@@ -911,6 +961,183 @@ void MqttHandler::publishSensorStatus()
 {
   // This is included in the main publishState() method
   publishState();
+}
+
+void MqttHandler::publishDiscovery()
+{
+  if (!_client.connected())
+  {
+    return;
+  }
+
+  Serial.println("Publishing Home Assistant MQTT Discovery...");
+
+  String deviceId = DEVICE_ID;
+  String uniqueIdBase = String("wtc_") + String(ESP.getChipId(), HEX);
+
+  // Device information (shared across all entities)
+  String deviceInfo = "\"device\":{";
+  deviceInfo += "\"identifiers\":[\"" + uniqueIdBase + "\"],";
+  deviceInfo += "\"name\":\"Water Tank Controller\",";
+  deviceInfo += "\"model\":\"ESP8266 Water Tank Pump Controller\",";
+  deviceInfo += "\"manufacturer\":\"DIY\",";
+  deviceInfo += "\"sw_version\":\"" + String(FIRMWARE_VERSION) + "\"";
+  deviceInfo += "}";
+
+  // 1. Low Water Sensor (Binary Sensor)
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/binary_sensor/" + deviceId + "_low_water/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank Low Level\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_low_water\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "\",";
+    payload += "\"value_template\":\"{{ value_json.contact }}\",";
+    payload += "\"payload_on\":true,";
+    payload += "\"payload_off\":false,";
+    payload += "\"device_class\":\"moisture\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+  // 2. High Water Sensor (Binary Sensor)
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/binary_sensor/" + deviceId + "_high_water/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank High Level\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_high_water\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "\",";
+    payload += "\"value_template\":\"{{ value_json.water_leak }}\",";
+    payload += "\"payload_on\":true,";
+    payload += "\"payload_off\":false,";
+    payload += "\"device_class\":\"moisture\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+  // 3. Pump State (Binary Sensor)
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/binary_sensor/" + deviceId + "_pump/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank Pump State\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_pump_state\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "/pump\",";
+    payload += "\"value_template\":\"{{ value_json.state }}\",";
+    payload += "\"payload_on\":\"ON\",";
+    payload += "\"payload_off\":\"OFF\",";
+    payload += "\"device_class\":\"running\",";
+    payload += "\"icon\":\"mdi:water-pump\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+  // 4. Pump Control Switch
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/switch/" + deviceId + "_control/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank Pump Control\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_pump_control\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "/pump\",";
+    payload += "\"value_template\":\"{{ value_json.state }}\",";
+    payload += "\"command_topic\":\"" + String(MQTT_COMMAND_TOPIC) + "\",";
+    payload += "\"payload_on\":\"{\\\"override\\\":true,\\\"state\\\":\\\"ON\\\"}\",";
+    payload += "\"payload_off\":\"{\\\"override\\\":true,\\\"state\\\":\\\"OFF\\\"}\",";
+    payload += "\"state_on\":\"ON\",";
+    payload += "\"state_off\":\"OFF\",";
+    payload += "\"icon\":\"mdi:water-pump\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+  // 5. WiFi Signal Strength (Sensor)
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/sensor/" + deviceId + "_rssi/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank WiFi Signal\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_rssi\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "\",";
+    payload += "\"value_template\":\"{{ value_json.linkquality }}\",";
+    payload += "\"unit_of_measurement\":\"lqi\",";
+    payload += "\"icon\":\"mdi:wifi\",";
+    payload += "\"state_class\":\"measurement\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+  // 6. Last Pump Duration (Sensor)
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/sensor/" + deviceId + "_duration/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank Last Pump Duration\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_duration\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "/pump\",";
+    payload += "\"value_template\":\"{{ value_json.last_duration_seconds }}\",";
+    payload += "\"unit_of_measurement\":\"s\",";
+    payload += "\"icon\":\"mdi:timer\",";
+    payload += "\"state_class\":\"measurement\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+  // 7. Firmware Version (Sensor)
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/sensor/" + deviceId + "_firmware/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank Firmware Version\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_firmware\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "\",";
+    payload += "\"value_template\":\"{{ value_json.firmware_version }}\",";
+    payload += "\"icon\":\"mdi:chip\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+  // 8. Last ON Timestamp (Sensor)
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/sensor/" + deviceId + "_last_on/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank Pump Last ON\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_last_on\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "/pump\",";
+    payload += "\"value_template\":\"{{ value_json.last_on }}\",";
+    payload += "\"device_class\":\"timestamp\",";
+    payload += "\"icon\":\"mdi:clock-start\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+  // 9. Last OFF Timestamp (Sensor)
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/sensor/" + deviceId + "_last_off/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank Pump Last OFF\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_last_off\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "/pump\",";
+    payload += "\"value_template\":\"{{ value_json.last_off }}\",";
+    payload += "\"device_class\":\"timestamp\",";
+    payload += "\"icon\":\"mdi:clock-end\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+  Serial.println("Home Assistant MQTT Discovery published successfully!");
 }
 
 void MqttHandler::setCommandCallback(CommandCallback callback)
@@ -1016,6 +1243,7 @@ private:
   String buildStatusPage();
   String buildSetupPage();
   String formatDuration(unsigned long milliseconds);
+  String formatPumpDuration(unsigned long milliseconds);
   String formatDateTime(time_t epoch);
 };
 
@@ -1117,7 +1345,8 @@ void WebServerHandler::handleSave()
   {
     int tz = _server.arg("timezone_offset").toInt();
     // Validate timezone offset (must be between -12 and +14)
-    if (tz >= -12 && tz <= 14) {
+    if (tz >= -12 && tz <= 14)
+    {
       settings.timezone_offset = tz;
     }
   }
@@ -1214,6 +1443,36 @@ String WebServerHandler::formatDuration(unsigned long milliseconds)
   }
 }
 
+String WebServerHandler::formatPumpDuration(unsigned long milliseconds)
+{
+  if (milliseconds == 0)
+  {
+    return "Not available";
+  }
+
+  unsigned long seconds = milliseconds / 1000;
+  unsigned long minutes = seconds / 60;
+  unsigned long hours = minutes / 60;
+  unsigned long days = hours / 24;
+
+  if (days > 0)
+  {
+    return String(days) + "d " + String(hours % 24) + "h " + String(minutes % 60) + "m";
+  }
+  else if (hours > 0)
+  {
+    return String(hours) + "h " + String(minutes % 60) + "m " + String(seconds % 60) + "s";
+  }
+  else if (minutes > 0)
+  {
+    return String(minutes) + "m " + String(seconds % 60) + "s";
+  }
+  else
+  {
+    return String(seconds) + "s";
+  }
+}
+
 String WebServerHandler::formatDateTime(time_t epoch)
 {
   if (epoch <= 1000000000)
@@ -1229,9 +1488,12 @@ String WebServerHandler::formatDateTime(time_t epoch)
 
   // Format timezone string (e.g., "GMT+7" or "GMT-5")
   char tz_str[10];
-  if (settings.timezone_offset >= 0) {
+  if (settings.timezone_offset >= 0)
+  {
     snprintf(tz_str, sizeof(tz_str), "GMT+%d", settings.timezone_offset);
-  } else {
+  }
+  else
+  {
     snprintf(tz_str, sizeof(tz_str), "GMT%d", settings.timezone_offset);
   }
 
@@ -1283,6 +1545,7 @@ String WebServerHandler::buildStatusPage()
   html += "</head><body>";
 
   html += "<h2>Water Tank Controller Status</h2>";
+  html += "<p style='color: #666; font-size: 14px;'>Firmware Version: <strong>" + String(FIRMWARE_VERSION) + "</strong></p>";
 
   // Pump Control Panel
   html += "<div class='control-panel'>";
@@ -1384,6 +1647,11 @@ String WebServerHandler::buildStatusPage()
   // Last pump OFF timestamp
   html += "<tr><td>Last OFF Timestamp</td><td>";
   html += formatDateTime(pumpController.getLastOffEpoch());
+  html += "</td></tr>";
+
+  // Last pump duration (from last ON to OFF)
+  html += "<tr><td>Last Pump Duration</td><td>";
+  html += formatPumpDuration(pumpController.getLastPumpDuration());
   html += "</td></tr>";
 
   // Calculate pump running duration if currently ON
@@ -1526,7 +1794,8 @@ void loop()
         pumpController.getLastOnTime(),
         pumpController.getLastOffTime(),
         pumpController.getLastOnEpoch(),
-        pumpController.getLastOffEpoch());
+        pumpController.getLastOffEpoch(),
+        pumpController.getLastPumpDuration());
     yield();
   }
 
