@@ -662,22 +662,25 @@ void PumpController::handleAutomaticControl(time_t currentTime)
   bool lowWater = waterLevel.isLowWaterDetected();
   bool highWater = waterLevel.isHighWaterDetected();
 
-  // Pump control logic:
-  // - Turn ON when low sensor is triggered (water level is low)
-  // - Turn OFF when high sensor is triggered (water level is high)
-  // - Maintain current state if both or neither sensors are triggered
+  // Pump control logic with proper hysteresis:
+  // - Turn ON when low sensor is NOT triggered (water below low sensor)
+  // - Turn OFF when high sensor IS triggered (water reaches high sensor)
+  // - Maintain current state when water is between sensors (hysteresis zone)
+  //
+  // Expected sensor behavior: HIGH = water present, LOW = water absent
+  // So we invert the logic: !lowWater means water is below low sensor
 
-  if (lowWater && !highWater)
+  if (!lowWater && !highWater)
   {
-    // Water is low, turn pump ON
+    // Water is below low sensor, turn pump ON
     setPumpState(true, currentTime);
   }
   else if (highWater)
   {
-    // Water is high, turn pump OFF
+    // Water reached high sensor, turn pump OFF
     setPumpState(false, currentTime);
   }
-  // If neither sensor is triggered, maintain current state (hysteresis)
+  // If only low sensor is triggered (water between sensors), maintain current state (hysteresis)
 }
 
 // ==================== MQTT HANDLER CLASS ====================
