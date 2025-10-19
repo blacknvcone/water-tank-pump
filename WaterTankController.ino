@@ -21,7 +21,7 @@
 // ==================== CONFIGURATION ====================
 
 // Firmware version
-#define FIRMWARE_VERSION "2.0.4"
+#define FIRMWARE_VERSION "2.0.6"
 
 // EEPROM addresses and size
 #define EEPROM_SIZE 256
@@ -491,6 +491,7 @@ public:
   // Control methods
   void setOverrideMode(bool enabled, bool state);
   bool isOverrideMode() const;
+  bool getOverrideState() const;
   bool getPumpState() const;
 
   // State change detection
@@ -583,6 +584,11 @@ void PumpController::setOverrideMode(bool enabled, bool state)
 bool PumpController::isOverrideMode() const
 {
   return _overrideMode;
+}
+
+bool PumpController::getOverrideState() const
+{
+  return _overrideState;
 }
 
 bool PumpController::getPumpState() const
@@ -740,7 +746,7 @@ private:
   PubSubClient _client;
   CommandCallback _commandCallback;
   unsigned long _lastStatusUpdate;
-  const long _statusUpdateInterval = 10000; // 10 seconds
+  const long _statusUpdateInterval = 5000; // 5 seconds
 
   // Format time as ISO8601
   bool formatISO8601(time_t t, char *out, size_t len);
@@ -888,6 +894,15 @@ void MqttHandler::publishState()
   // Add sensor states
   doc["contact"] = waterLevel.isLowWaterDetected();
   doc["water_leak"] = waterLevel.isHighWaterDetected();
+
+  // Add control mode
+  doc["control_mode"] = pumpController.isOverrideMode() ? "manual" : "automatic";
+
+  // Add override state (for mode select dropdown)
+  if (pumpController.isOverrideMode())
+  {
+    doc["override_state"] = pumpController.getOverrideState();
+  }
 
   // Add link quality (WiFi RSSI mapped to 0-255)
   long rssi = WiFi.RSSI();
@@ -1131,6 +1146,39 @@ void MqttHandler::publishDiscovery()
     payload += "\"value_template\":\"{{ value_json.last_off }}\",";
     payload += "\"device_class\":\"timestamp\",";
     payload += "\"icon\":\"mdi:clock-end\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+  // 10. Control Mode (Sensor)
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/sensor/" + deviceId + "_control_mode/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank Control Mode\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_control_mode\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "\",";
+    payload += "\"value_template\":\"{{ value_json.control_mode }}\",";
+    payload += "\"icon\":\"mdi:cog\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+  // 11. Control Mode Select (to switch between Automatic/Manual ON/Manual OFF)
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/select/" + deviceId + "_mode_select/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank Mode Select\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_mode_select\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "\",";
+    payload += "\"value_template\":\"{% if value_json.control_mode == 'automatic' %}Automatic{% elif value_json.override_state == true %}Manual ON{% else %}Manual OFF{% endif %}\",";
+    payload += "\"command_topic\":\"" + String(MQTT_COMMAND_TOPIC) + "\",";
+    payload += "\"command_template\":\"{% if value == 'Automatic' %}{\\\"override\\\":false}{% elif value == 'Manual ON' %}{\\\"override\\\":true,\\\"state\\\":\\\"ON\\\"}{% else %}{\\\"override\\\":true,\\\"state\\\":\\\"OFF\\\"}{% endif %}\",";
+    payload += "\"options\":[\"Automatic\",\"Manual ON\",\"Manual OFF\"],";
+    payload += "\"icon\":\"mdi:dip-switch\",";
     payload += deviceInfo;
     payload += "}";
     _client.publish(topic.c_str(), payload.c_str(), true);
