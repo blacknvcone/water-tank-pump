@@ -21,7 +21,7 @@
 // ==================== CONFIGURATION ====================
 
 // Firmware version
-#define FIRMWARE_VERSION "2.0.6"
+#define FIRMWARE_VERSION "2.1.0"
 
 // EEPROM addresses and size
 #define EEPROM_SIZE 256
@@ -30,6 +30,9 @@
 #define MQTT_ADDR 0
 #define OTA_PASS_ADDR 200
 #define TIMEZONE_ADDR 220
+#define LAST_BOOT_TIME_ADDR 224    // Store last boot time (4 bytes)
+#define LAST_MILLIS_ADDR 228       // Store millis at last time sync (4 bytes)
+#define TIME_SYNC_INTERVAL_ADDR 232 // Store time sync interval (1 byte)
 
 // GPIO PIN definitions
 #define LOW_SENSOR_PIN 4  // D2
@@ -216,6 +219,9 @@ public:
   bool isTimeSynced() const;
   time_t getCurrentTime() const;
   void startTimeSync();
+  void saveTimeToEEPROM(time_t currentTime);
+  void loadTimeFromEEPROM();
+  bool isValidTime(time_t t) const;
 
   // LED management
   void updateLED(bool pumpState, bool overrideMode);
@@ -224,15 +230,22 @@ private:
   bool _apMode;
   bool _timeSyncStarted;
   bool _timeSynced;
+  bool _useCompensatedTime;    // Use millis-based compensation when NTP unavailable
+  time_t _lastKnownTime;       // Last known good time from NTP or EEPROM
+  unsigned long _lastMillis;   // millis() at last time sync/check
   unsigned long _ledBlinkTimer;
   bool _ledState;
 
   void checkTimeSync();
+  void updateCompensatedTime();
 };
 
 SystemManager::SystemManager() : _apMode(false),
                                  _timeSyncStarted(false),
                                  _timeSynced(false),
+                                 _useCompensatedTime(false),
+                                 _lastKnownTime(0),
+                                 _lastMillis(0),
                                  _ledBlinkTimer(0),
                                  _ledState(false)
 {
@@ -248,6 +261,9 @@ void SystemManager::begin()
 
   // Load settings
   settings.begin();
+
+  // Load time from EEPROM before network operations
+  loadTimeFromEEPROM();
 
   // Try to connect to WiFi
   Serial.print("Connecting to WiFi");
@@ -280,6 +296,9 @@ void SystemManager::begin()
 
 void SystemManager::loop()
 {
+  // Update compensated time even without network
+  updateCompensatedTime();
+
   if (!_apMode && WiFi.status() == WL_CONNECTED)
   {
     if (!_timeSyncStarted)
@@ -319,6 +338,23 @@ bool SystemManager::isTimeSynced() const
 
 time_t SystemManager::getCurrentTime() const
 {
+  // First try to get NTP time if synced
+  if (_timeSynced)
+  {
+    time_t ntpTime = time(nullptr);
+    if (isValidTime(ntpTime))
+    {
+      return ntpTime;
+    }
+  }
+
+  // Fall back to compensated time if available
+  if (_useCompensatedTime && _lastKnownTime > 0)
+  {
+    return _lastKnownTime;
+  }
+
+  // Last resort - return system time (may be invalid)
   return time(nullptr);
 }
 
@@ -330,16 +366,44 @@ void SystemManager::startTimeSync()
   Serial.println("Starting time sync with NTP...");
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   _timeSyncStarted = true;
+
+  // Set current millis for compensation
+  _lastMillis = millis();
 }
 
 void SystemManager::checkTimeSync()
 {
   time_t now = time(nullptr);
-  if (now > 1000000000)
-  { // Valid timestamp (after 2001)
-    _timeSynced = true;
-    Serial.print("Time synced: ");
-    Serial.println(ctime(&now));
+  if (isValidTime(now))
+  {
+    if (!_timeSynced)
+    {
+      _timeSynced = true;
+      _useCompensatedTime = false;
+      _lastKnownTime = now;
+      _lastMillis = millis();
+
+      Serial.print("Time synced: ");
+      Serial.println(ctime(&now));
+
+      // Save valid time to EEPROM for persistence
+      saveTimeToEEPROM(now);
+    }
+    else
+    {
+      // Time is still valid, update our tracking
+      _lastKnownTime = now;
+      _lastMillis = millis();
+    }
+  }
+  else
+  {
+    // NTP time not available, check if we should use compensated time
+    if (!_useCompensatedTime && _lastKnownTime > 0)
+    {
+      Serial.println("NTP time unavailable, using compensated time from EEPROM");
+      _useCompensatedTime = true;
+    }
   }
 }
 
@@ -371,6 +435,97 @@ void SystemManager::updateLED(bool pumpState, bool overrideMode)
   {
     // Solid on when WiFi connected and pump is off
     digitalWrite(LED_PIN, LOW);
+  }
+}
+
+// ==================== TIME SYNC HELPER METHODS ====================
+
+bool SystemManager::isValidTime(time_t t) const
+{
+  return (t > 1000000000); // After September 2001
+}
+
+void SystemManager::saveTimeToEEPROM(time_t currentTime)
+{
+  if (!isValidTime(currentTime))
+    return;
+
+  // Save the last known good time and current millis
+  EEPROM.put(LAST_BOOT_TIME_ADDR, currentTime);
+  EEPROM.put(LAST_MILLIS_ADDR, millis());
+
+  // Mark that we have valid time saved
+  uint8_t timeValid = 1;
+  EEPROM.put(TIME_SYNC_INTERVAL_ADDR, timeValid);
+
+  EEPROM.commit();
+  Serial.println("Time saved to EEPROM for persistence");
+}
+
+void SystemManager::loadTimeFromEEPROM()
+{
+  // Check if we have previously saved time
+  uint8_t timeValid;
+  EEPROM.get(TIME_SYNC_INTERVAL_ADDR, timeValid);
+
+  if (timeValid == 1)
+  {
+    time_t savedTime;
+    unsigned long savedMillis;
+
+    EEPROM.get(LAST_BOOT_TIME_ADDR, savedTime);
+    EEPROM.get(LAST_MILLIS_ADDR, savedMillis);
+
+    if (isValidTime(savedTime))
+    {
+      // Calculate time elapsed since last save
+      unsigned long elapsedMillis = millis() - savedMillis;
+      time_t elapsedSeconds = elapsedMillis / 1000;
+
+      // Update last known time with elapsed time
+      _lastKnownTime = savedTime + elapsedSeconds;
+      _lastMillis = millis();
+      _useCompensatedTime = true;
+
+      Serial.print("Loaded time from EEPROM: ");
+      Serial.print(ctime(&_lastKnownTime));
+      Serial.print("Time elapsed since last save: ");
+      Serial.print(elapsedSeconds);
+      Serial.println(" seconds");
+    }
+  }
+  else
+  {
+    Serial.println("No valid time found in EEPROM, waiting for NTP sync");
+    _useCompensatedTime = false;
+    _lastKnownTime = 0;
+    _lastMillis = 0;
+  }
+}
+
+void SystemManager::updateCompensatedTime()
+{
+  if (_useCompensatedTime && _lastKnownTime > 0)
+  {
+    // Calculate elapsed time since last update
+    unsigned long currentMillis = millis();
+    unsigned long elapsedMillis = currentMillis - _lastMillis;
+
+    // Update compensated time every second
+    if (elapsedMillis >= 1000)
+    {
+      time_t elapsedSeconds = elapsedMillis / 1000;
+      _lastKnownTime += elapsedSeconds;
+      _lastMillis = currentMillis;
+
+      // Save updated time to EEPROM periodically (every 5 minutes)
+      static unsigned long lastSaveTime = 0;
+      if (currentMillis - lastSaveTime > 300000) // 5 minutes
+      {
+        saveTimeToEEPROM(_lastKnownTime);
+        lastSaveTime = currentMillis;
+      }
+    }
   }
 }
 
@@ -628,8 +783,8 @@ unsigned long PumpController::getLastPumpDuration() const
 
 void PumpController::updateTimestamps(time_t currentTime)
 {
-  // Update epoch timestamps if time is synced and we have boot timestamps
-  if (currentTime > 1000000000)
+  // Update epoch timestamps if time is valid and we have boot timestamps
+  if (currentTime > 1000000000) // Use same validation as SystemManager
   {
     unsigned long currentMillis = millis();
 
@@ -1285,6 +1440,8 @@ private:
   void handleSetup();
   void handleSave();
   void handlePumpControl();
+  void handleTimeSync();
+  void handleRestart();
   void handleNotFound();
 
   // Helper methods
@@ -1310,6 +1467,10 @@ void WebServerHandler::begin()
              { handleSave(); });
   _server.on("/pump", HTTP_POST, [this]()
              { handlePumpControl(); });
+  _server.on("/timesync", HTTP_POST, [this]()
+             { handleTimeSync(); });
+  _server.on("/restart", HTTP_POST, [this]()
+             { handleRestart(); });
   _server.onNotFound([this]()
                      { handleNotFound(); });
 
@@ -1453,6 +1614,108 @@ void WebServerHandler::handlePumpControl()
   _server.send(303);
 }
 
+void WebServerHandler::handleTimeSync()
+{
+  Serial.println("Web: Manual time sync requested");
+
+  // Check if WiFi is connected
+  if (!systemManager.isWiFiConnected())
+  {
+    _server.send(400, "text/plain", "WiFi not connected. Time sync requires internet access.");
+    return;
+  }
+
+  // Force restart time sync
+  systemManager.startTimeSync();
+
+  // Check immediately if time sync works
+  delay(2000); // Give NTP some time to respond
+
+  time_t currentTime = systemManager.getCurrentTime();
+  if (currentTime > 1000000000) // Use same validation as SystemManager
+  {
+    String response = "Time sync successful!\n\n";
+    response += "Current time: ";
+
+    char timeStr[50];
+    struct tm *timeinfo = gmtime(&currentTime);
+    if (timeinfo)
+    {
+      snprintf(timeStr, sizeof(timeStr), "%04d-%02d-%02d %02d:%02d:%02d UTC",
+               timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+               timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+      response += timeStr;
+    }
+    else
+    {
+      response += String(currentTime) + " (epoch)";
+    }
+
+    response += "\n\nRedirecting to status page...";
+    _server.send(200, "text/plain", response);
+  }
+  else
+  {
+    _server.send(503, "text/plain", "Time sync failed. NTP servers may be unreachable. Please try again later.");
+  }
+
+  // Redirect back to home page after a delay
+  _server.sendHeader("Refresh", "3; url=/");
+}
+
+void WebServerHandler::handleRestart()
+{
+  Serial.println("Web: Device restart requested");
+
+  // Send response page first
+  String html = "<!DOCTYPE html><html><head><title>Restarting Device</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }";
+  html += ".container { max-width: 500px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); text-align: center; }";
+  html += ".icon { font-size: 48px; margin-bottom: 20px; }";
+  html += ".message { font-size: 18px; margin: 20px 0; color: #333; }";
+  html += ".countdown { font-size: 24px; font-weight: bold; color: #f44336; margin: 15px 0; }";
+  html += ".progress { width: 100%; height: 8px; background-color: #e0e0e0; border-radius: 4px; overflow: hidden; margin: 20px 0; }";
+  html += ".progress-bar { height: 100%; background-color: #4CAF50; transition: width 1s linear; }";
+  html += "</style>";
+  html += "<script>";
+  html += "let countdown = 30;";
+  html += "function updateCountdown() {";
+  html += "  countdown--;";
+  html += "  document.getElementById('countdown').textContent = countdown;";
+  html += "  document.getElementById('progress').style.width = ((30-countdown)/30*100) + '%';";
+  html += "  if (countdown <= 0) {";
+  html += "    document.getElementById('status').innerHTML = 'Device should be restarted now.<br>Redirecting...';";
+  html += "    setTimeout(function() { window.location.href = '/'; }, 2000);";
+  html += "  } else {";
+  html += "    setTimeout(updateCountdown, 1000);";
+  html += "  }";
+  html += "}";
+  html += "window.onload = function() { updateCountdown(); };";
+  html += "</script>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<div class='icon'>🔄</div>";
+  html += "<h2>Device Restarting</h2>";
+  html += "<p class='message'>The Water Tank Controller is restarting...</p>";
+  html += "<p class='message'>Please wait for the device to come back online.</p>";
+  html += "<div class='countdown' id='countdown'>30</div>";
+  html += "<p class='message'>seconds remaining</p>";
+  html += "<div class='progress'><div class='progress-bar' id='progress' style='width: 0%'></div></div>";
+  html += "<p id='status' style='color: #666; font-size: 14px;'>Do not close this page. It will automatically redirect when the device is back online.</p>";
+  html += "</div></body></html>";
+
+  _server.send(200, "text/html", html);
+
+  // Delay briefly to ensure response is sent
+  delay(100);
+
+  // Restart the ESP8266
+  Serial.println("Restarting ESP8266 now...");
+  ESP.restart();
+}
+
 void WebServerHandler::handleNotFound()
 {
   String message = "File Not Found\n\n";
@@ -1571,6 +1834,7 @@ String WebServerHandler::buildStatusPage()
   html += "tr:nth-child(even) { background-color: #f2f2f2; }";
   html += ".status-on { color: green; font-weight: bold; }";
   html += ".status-off { color: red; font-weight: bold; }";
+  html += ".status-warning { color: orange; font-weight: bold; }";
   html += ".button { display: inline-block; padding: 10px 20px; margin: 10px 5px; ";
   html += "background-color: #4CAF50; color: white; text-decoration: none; border-radius: 4px; border: none; cursor: pointer; }";
   html += ".button:hover { background-color: #45a049; }";
@@ -1588,6 +1852,9 @@ String WebServerHandler::buildStatusPage()
   html += "var refreshTimer;";
   html += "function autoRefresh() { refreshTimer = setTimeout(function(){ location.reload(); }, 5000); }";
   html += "function stopRefresh() { clearTimeout(refreshTimer); }";
+  html += "function confirmRestart() {";
+  html += "  return confirm('Are you sure you want to restart the device?\\n\\nThe web interface will be unavailable for about 30 seconds.\\n\\nClick OK to restart or Cancel to continue.');";
+  html += "}";
   html += "window.onload = autoRefresh;";
   html += "</script>";
   html += "</head><body>";
@@ -1619,6 +1886,32 @@ String WebServerHandler::buildStatusPage()
   html += "</strong></p>";
   html += "</div>";
 
+  // Time Sync Control
+  html += "<div class='control-panel'>";
+  html += "<h3>Time Sync Control</h3>";
+  html += "<div class='control-buttons'>";
+  html += "<form method='POST' action='/timesync' style='display: inline;'>";
+  html += "<button type='submit' class='button' onclick='stopRefresh()'>Force Time Sync</button>";
+  html += "</form>";
+  html += "</div>";
+  html += "<p style='font-size: 12px; color: #666; margin-top: 10px;'>";
+  html += "Attempts to sync time with NTP servers. Works only when WiFi is connected.";
+  html += "</p>";
+  html += "</div>";
+
+  // Device Control
+  html += "<div class='control-panel'>";
+  html += "<h3>Device Control</h3>";
+  html += "<div class='control-buttons'>";
+  html += "<form method='POST' action='/restart' style='display: inline;' onsubmit='return confirmRestart();'>";
+  html += "<button type='submit' class='button button-danger' onclick='stopRefresh()'>Restart Device</button>";
+  html += "</form>";
+  html += "</div>";
+  html += "<p style='font-size: 12px; color: #666; margin-top: 10px;'>";
+  html += "⚠️ Restarts the ESP8266 device. Web interface will be unavailable for ~30 seconds.";
+  html += "</p>";
+  html += "</div>";
+
   html += "<div class='container'>";
 
   // General Status Table
@@ -1636,6 +1929,26 @@ String WebServerHandler::buildStatusPage()
   {
     html += "<tr><td>IP Address</td><td>" + systemManager.getIPAddress() + "</td></tr>";
   }
+
+  // Time sync status
+  html += "<tr><td>Time Sync</td><td class='";
+  if (systemManager.isTimeSynced())
+  {
+    html += "status-on'>NTP Synced";
+  }
+  else
+  {
+    time_t currentTime = systemManager.getCurrentTime();
+    if (currentTime > 1000000000)
+    {
+      html += "status-warning'>Compensated";
+    }
+    else
+    {
+      html += "status-off'>Not Synced";
+    }
+  }
+  html += "</td></tr>";
 
   // MQTT status
   html += "<tr><td>MQTT</td><td class='";
