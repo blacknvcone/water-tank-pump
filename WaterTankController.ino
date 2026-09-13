@@ -2208,6 +2208,7 @@ String WebServerHandler::buildStatusPage()
   html += "}).catch(()=>{})}";
   html += "poll();setInterval(poll,3000);";
   html += "function pump(a){fetch('/pump',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action='+a}).then(()=>setTimeout(poll,300))}";
+  html += "</script>";
   html += "</body></html>";
 
   return html;
