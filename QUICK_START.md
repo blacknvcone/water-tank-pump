@@ -63,5 +63,17 @@ GND             →       Common Ground
 3.3V            →       Sensor Power (if needed)
 ```
 
+## RTC Module (Optional but Recommended)
+
+Connect DS1302N RTC module (5-pin):
+```
+VCC  → 3.3V
+GND  → GND
+CLK  → D6 (GPIO12)
+DAT  → D7 (GPIO13)
+RST  → D3 (GPIO0)
+```
+Insert CR2032 battery into the module's onboard holder.
+
 ## Need Help?
 See the full **README.md** for detailed documentation.

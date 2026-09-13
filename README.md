@@ -22,6 +22,7 @@ An intelligent IoT-based water tank pump controller with automatic water level m
 - **Relay Module** (5V compatible, for pump control)
 - **Water Pump** (appropriate for your tank size)
 - **Power Supply** (5V for ESP8266, appropriate voltage for pump)
+- **DS1302N RTC Module** (with CR2032 battery) - Real-time clock for accurate time on boot
 
 ### Pin Configuration
 
@@ -32,6 +33,9 @@ GPIO 2      D4             Built-in LED (status indicator)
 GPIO 4      D2             Low water level sensor
 GPIO 5      D1             High water level sensor
 GPIO 14     D5             Relay control (pump)
+GPIO 12     D6             DS1302 CLK (RTC clock)
+GPIO 13     D7             DS1302 DAT (RTC data)
+GPIO 0      D3             DS1302 RST (RTC chip enable)
 ```
 
 ## Software Requirements
@@ -56,6 +60,7 @@ GPIO 14     D5             Relay control (pump)
      - `PubSubClient` by Nick O'Leary
      - `ArduinoJson` by Benoit Blanchon (v6.x)
      - `WiFiManager` by tzapu
+     - `Rtc_by_Makuna` by Makuna (for DS1302 RTC module)
 
 ### Board Configuration
 
@@ -351,6 +356,13 @@ This project is open source and available under the MIT License.
 Dani Prasetya
 
 ## Version History
+
+- **v2.2.0** - DS1302 RTC integration for reliable time on boot
+  - Added DS1302N RTC as primary time source
+  - NTP syncs RTC when network available
+  - EEPROM time kept as fallback if RTC battery dies
+  - RTC status visible in web UI and MQTT
+  - Reduced EEPROM save interval to 24 hours (was 5 min)
 
 - **v2.0** - Modular refactoring with improved maintainability
   - Separated concerns into distinct modules

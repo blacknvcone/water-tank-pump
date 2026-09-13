@@ -17,11 +17,12 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <RtcDS1302.h>
 
 // ==================== CONFIGURATION ====================
 
 // Firmware version
-#define FIRMWARE_VERSION "2.1.0"
+#define FIRMWARE_VERSION "2.2.0"
 
 // EEPROM addresses and size
 #define EEPROM_SIZE 256
@@ -39,6 +40,11 @@
 #define HIGH_SENSOR_PIN 5 // D1
 #define RELAY_PIN 14      // D5
 #define LED_PIN 2         // D4 (Built-in LED, active low)
+
+// DS1302 RTC Pin definitions
+#define RTC_CLK_PIN 12  // D6
+#define RTC_DAT_PIN 13  // D7
+#define RTC_CE_PIN  0   // D3
 
 // MQTT topics
 #define DEVICE_ID "water_tank_controller"
@@ -200,6 +206,169 @@ extern class PumpController pumpController;
 extern class MqttHandler mqttClient;
 extern class WebServerHandler webServer;
 
+
+// ==================== RTC MANAGER CLASS ====================
+
+class RtcManager
+{
+public:
+  RtcManager();
+
+  void begin();
+
+  // Time operations
+  time_t getRtcTime() const;
+  bool isRtcValid() const;
+  void setRtcTime(time_t t);
+  void syncFromNtp(time_t ntpTime);
+
+  // Diagnostics
+  const char* getBatteryHealth() const;
+
+private:
+  ThreeWire _wire;
+  mutable RtcDS1302<ThreeWire> _rtc; // mutable: GetDateTime() not const in library
+  bool _initialized;
+  bool _rtcAvailable;
+  long _lastDriftSeconds;
+};
+
+RtcManager::RtcManager() : _wire(RTC_DAT_PIN, RTC_CLK_PIN, RTC_CE_PIN),
+                           _rtc(_wire),
+                           _initialized(false),
+                           _rtcAvailable(false),
+                           _lastDriftSeconds(0)
+{
+}
+
+void RtcManager::begin()
+{
+  Serial.println("Initializing DS1302 RTC...");
+
+  Serial.print("RTC pins - CLK:");
+  Serial.print(RTC_CLK_PIN);
+  Serial.print(" DAT:");
+  Serial.print(RTC_DAT_PIN);
+  Serial.print(" CE:");
+  Serial.println(RTC_CE_PIN);
+
+  _rtc.Begin();
+
+  _rtc.SetIsWriteProtected(false);
+  Serial.println("Write protect disabled");
+
+  _rtc.SetIsRunning(true);
+  Serial.println("Clock halted bit cleared");
+
+  RtcDateTime dt = _rtc.GetDateTime();
+  Serial.print("Raw read - Year:");
+  Serial.print(dt.Year());
+  Serial.print(" Month:");
+  Serial.print(dt.Month());
+  Serial.print(" Day:");
+  Serial.print(dt.Day());
+  Serial.print(" Hour:");
+  Serial.print(dt.Hour());
+  Serial.print(" Min:");
+  Serial.print(dt.Minute());
+  Serial.print(" Sec:");
+  Serial.println(dt.Second());
+
+  if (dt.IsValid())
+  {
+    _rtcAvailable = true;
+    _initialized = true;
+
+    time_t rtcTime = dt.Epoch32Time();
+    Serial.print("RTC time: ");
+    char buf[30];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+             dt.Year(), dt.Month(), dt.Day(),
+             dt.Hour(), dt.Minute(), dt.Second());
+    Serial.println(buf);
+  }
+  else
+  {
+    Serial.println("RTC time invalid. Check wiring:");
+    Serial.println("  CLK -> D6 (GPIO12)");
+    Serial.println("  DAT -> D7 (GPIO13)");
+    Serial.println("  RST -> D3 (GPIO0)");
+    Serial.println("  VCC -> 3.3V (try 5V if still failing)");
+    Serial.println("  GND -> GND");
+    _rtcAvailable = true;
+    _initialized = true;
+  }
+}
+
+time_t RtcManager::getRtcTime() const
+{
+  if (!_initialized || !_rtcAvailable)
+    return 0;
+
+  RtcDateTime dt = _rtc.GetDateTime();
+  if (dt.IsValid())
+  {
+    return dt.Epoch32Time();
+  }
+  return 0;
+}
+
+bool RtcManager::isRtcValid() const
+{
+  return _initialized && _rtcAvailable && getRtcTime() > 1000000000;
+}
+
+void RtcManager::setRtcTime(time_t t)
+{
+  if (!_initialized || !_rtcAvailable || t <= 1000000000)
+    return;
+
+  RtcDateTime dt;
+  dt.InitWithEpoch32Time(t);
+  _rtc.SetDateTime(dt);
+
+  Serial.print("RTC updated: ");
+  Serial.println(ctime(&t));
+}
+
+void RtcManager::syncFromNtp(time_t ntpTime)
+{
+  if (ntpTime > 1000000000)
+  {
+    time_t rtcTime = getRtcTime();
+    if (rtcTime > 1000000000)
+    {
+      _lastDriftSeconds = (long)(ntpTime - rtcTime);
+      Serial.print("RTC drift from NTP: ");
+      Serial.print(_lastDriftSeconds);
+      Serial.println(" seconds");
+    }
+
+    setRtcTime(ntpTime);
+  }
+}
+
+const char* RtcManager::getBatteryHealth() const
+{
+  if (!_initialized || !_rtcAvailable)
+    return "unknown";
+
+  time_t rtcTime = getRtcTime();
+  if (rtcTime <= 1000000000)
+    return "dead";
+
+  if (_lastDriftSeconds != 0)
+  {
+    long absDrift = _lastDriftSeconds < 0 ? -_lastDriftSeconds : _lastDriftSeconds;
+    if (absDrift > 300)
+      return "weak";
+  }
+
+  return "good";
+}
+
+RtcManager rtcManager;
+
 // ==================== SYSTEM MANAGER CLASS ====================
 
 class SystemManager
@@ -262,8 +431,24 @@ void SystemManager::begin()
   // Load settings
   settings.begin();
 
-  // Load time from EEPROM before network operations
-  loadTimeFromEEPROM();
+  // Initialize RTC first (instant time, no network needed)
+  rtcManager.begin();
+
+  // Load time: RTC is primary, EEPROM is fallback
+  time_t rtcTime = rtcManager.getRtcTime();
+  if (rtcTime > 1000000000)
+  {
+    _lastKnownTime = rtcTime + (settings.timezone_offset * 3600);
+    _lastMillis = millis();
+    _useCompensatedTime = true;
+    Serial.print("Time from RTC (local): ");
+    Serial.println(ctime(&_lastKnownTime));
+  }
+  else
+  {
+    Serial.println("RTC unavailable, falling back to EEPROM time");
+    loadTimeFromEEPROM();
+  }
 
   // Try to connect to WiFi
   Serial.print("Connecting to WiFi");
@@ -364,7 +549,19 @@ void SystemManager::startTimeSync()
     return;
 
   Serial.println("Starting time sync with NTP...");
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Timezone offset: GMT+");
+  Serial.println(settings.timezone_offset);
+
+  // Set TZ environment variable directly (POSIX format)
+  // POSIX convention: the offset is local->UTC, so UTC-7 = GMT+7
+  char tzStr[16];
+  snprintf(tzStr, sizeof(tzStr), "UTC%d", -settings.timezone_offset);
+  setenv("TZ", tzStr, 1);
+  tzset();
+  Serial.print("TZ set to: ");
+  Serial.println(tzStr);
+
+  configTime(settings.timezone_offset * 3600, 0, "pool.ntp.org", "time.nist.gov");
   _timeSyncStarted = true;
 
   // Set current millis for compensation
@@ -386,8 +583,14 @@ void SystemManager::checkTimeSync()
       Serial.print("Time synced: ");
       Serial.println(ctime(&now));
 
-      // Save valid time to EEPROM for persistence
-      saveTimeToEEPROM(now);
+      // Convert to UTC for storage in RTC and EEPROM
+      time_t utcNow = now - (settings.timezone_offset * 3600);
+
+      // Save valid time to EEPROM for persistence (UTC)
+      saveTimeToEEPROM(utcNow);
+
+      // Sync NTP time to RTC for persistence (UTC)
+      rtcManager.syncFromNtp(utcNow);
     }
     else
     {
@@ -482,8 +685,8 @@ void SystemManager::loadTimeFromEEPROM()
       unsigned long elapsedMillis = millis() - savedMillis;
       time_t elapsedSeconds = elapsedMillis / 1000;
 
-      // Update last known time with elapsed time
-      _lastKnownTime = savedTime + elapsedSeconds;
+      // EEPROM stores UTC - convert to local time
+      _lastKnownTime = savedTime + elapsedSeconds + (settings.timezone_offset * 3600);
       _lastMillis = millis();
       _useCompensatedTime = true;
 
@@ -518,11 +721,14 @@ void SystemManager::updateCompensatedTime()
       _lastKnownTime += elapsedSeconds;
       _lastMillis = currentMillis;
 
-      // Save updated time to EEPROM periodically (every 5 minutes)
+      // Save updated time to EEPROM periodically (every 24 hours, RTC is primary)
       static unsigned long lastSaveTime = 0;
-      if (currentMillis - lastSaveTime > 300000) // 5 minutes
+      if (currentMillis - lastSaveTime > 86400000) // 24 hours
       {
-        saveTimeToEEPROM(_lastKnownTime);
+        // Convert to UTC for storage
+        time_t utcTime = _lastKnownTime - (settings.timezone_offset * 3600);
+        saveTimeToEEPROM(utcTime);
+        rtcManager.syncFromNtp(utcTime); // Keep RTC accurate
         lastSaveTime = currentMillis;
       }
     }
@@ -1041,10 +1247,12 @@ void MqttHandler::publishState()
   }
 
   // Create JSON document
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<576> doc;
 
   // Add firmware version
   doc["firmware_version"] = FIRMWARE_VERSION;
+  doc["rtc"] = rtcManager.isRtcValid();
+  doc["battery_health"] = rtcManager.getBatteryHealth();
 
   // Add sensor states
   doc["contact"] = waterLevel.isLowWaterDetected();
@@ -1340,7 +1548,40 @@ void MqttHandler::publishDiscovery()
     yield();
   }
 
-  Serial.println("Home Assistant MQTT Discovery published successfully!");
+  
+  // 12. RTC Status (Binary Sensor)
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/binary_sensor/" + deviceId + "_rtc/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank RTC Status\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_rtc\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "\",";
+    payload += "\"value_template\":\"{{ value_json.rtc }}\",";
+    payload += "\"payload_on\":true,";
+    payload += "\"payload_off\":false,";
+    payload += "\"icon\":\"mdi:chip\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+  // 13. RTC Battery Health (Sensor)
+  {
+    String topic = String(HA_DISCOVERY_PREFIX) + "/sensor/" + deviceId + "_battery_health/config";
+    String payload = "{";
+    payload += "\"name\":\"Water Tank RTC Battery\",";
+    payload += "\"unique_id\":\"" + uniqueIdBase + "_battery_health\",";
+    payload += "\"state_topic\":\"" + String(MQTT_STATE_TOPIC) + "\",";
+    payload += "\"value_template\":\"{{ value_json.battery_health }}\",";
+    payload += "\"icon\":\"mdi:battery\",";
+    payload += deviceInfo;
+    payload += "}";
+    _client.publish(topic.c_str(), payload.c_str(), true);
+    yield();
+  }
+
+Serial.println("Home Assistant MQTT Discovery published successfully!");
 }
 
 void MqttHandler::setCommandCallback(CommandCallback callback)
@@ -1437,6 +1678,7 @@ private:
 
   // Route handlers
   void handleRoot();
+  void handleApiStatus();
   void handleSetup();
   void handleSave();
   void handlePumpControl();
@@ -1461,6 +1703,8 @@ void WebServerHandler::begin()
   // Setup routes
   _server.on("/", [this]()
              { handleRoot(); });
+  _server.on("/api/status", HTTP_GET, [this]()
+             { handleApiStatus(); });
   _server.on("/setup", [this]()
              { handleSetup(); });
   _server.on("/save", HTTP_POST, [this]()
@@ -1495,6 +1739,34 @@ void WebServerHandler::handleRoot()
 {
   String html = buildStatusPage();
   _server.send(200, "text/html", html);
+}
+
+
+void WebServerHandler::handleApiStatus()
+{
+  String json = "{";
+  json += "\"firmware\":\"" + String(FIRMWARE_VERSION) + "\",";
+  json += "\"wifi\":" + String(systemManager.isWiFiConnected() ? "true" : "false") + ",";
+  json += "\"ip\":\"" + systemManager.getIPAddress() + "\",";
+  json += "\"mqtt\":" + String(mqttClient.isConnected() ? "true" : "false") + ",";
+  json += "\"time_synced\":" + String(systemManager.isTimeSynced() ? "true" : "false") + ",";
+  json += "\"rtc_valid\":" + String(rtcManager.isRtcValid() ? "true" : "false") + ",";
+  json += "\"battery_health\":\"" + String(rtcManager.getBatteryHealth()) + "\",";
+  json += "\"low_water\":" + String(waterLevel.isLowWaterDetected() ? "true" : "false") + ",";
+  json += "\"high_water\":" + String(waterLevel.isHighWaterDetected() ? "true" : "false") + ",";
+  json += "\"pump\":" + String(pumpController.getPumpState() ? "true" : "false") + ",";
+  json += "\"override_mode\":" + String(pumpController.isOverrideMode() ? "true" : "false") + ",";
+  json += "\"override_state\":" + String(pumpController.getOverrideState() ? "true" : "false") + ",";
+  unsigned long uptime = millis() / 1000;
+  json += "\"uptime\":" + String(uptime) + ",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"pump_last_on\":" + String(pumpController.getLastOnTime()) + ",";
+  json += "\"pump_last_off\":" + String(pumpController.getLastOffTime()) + ",";
+  json += "\"pump_duration\":" + String(pumpController.getLastPumpDuration()) + ",";
+  time_t now = systemManager.getCurrentTime();
+  json += "\"current_time\":" + String((unsigned long)now);
+  json += "}";
+  _server.send(200, "application/json", json);
 }
 
 void WebServerHandler::handleSetup()
@@ -1822,8 +2094,124 @@ String WebServerHandler::formatDateTime(time_t epoch)
 String WebServerHandler::buildStatusPage()
 {
   String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<title>Water Tank Controller</title>";
+  html += "<style>";
+  html += "*{margin:0;padding:0;box-sizing:border-box}";
+  html += ":root{--bg:#f5f7fa;--card:#fff;--text:#1a1a2e;--dim:#6b7280;--border:#e5e7eb;--green:#10b981;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6}";
+  html += "@media(prefers-color-scheme:dark){:root{--bg:#0f172a;--card:#1e293b;--text:#e2e8f0;--dim:#94a3b8;--border:#334155}}";
+  html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);padding:16px;max-width:800px;margin:0 auto}";
+  html += "h1{font-size:1.4rem;margin-bottom:4px}";
+  html += ".sub{color:var(--dim);font-size:.8rem;margin-bottom:16px}";
+  html += ".card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:12px}";
+  html += ".card h2{font-size:1rem;margin-bottom:12px;display:flex;align-items:center;gap:8px}";
+  html += ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}";
+  html += ".stat{display:flex;flex-direction:column;gap:2px}";
+  html += ".stat .label{font-size:.75rem;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}";
+  html += ".stat .value{font-size:1.1rem;font-weight:600}";
+  html += ".dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}";
+  html += ".dot.on{background:var(--green)}.dot.off{background:var(--red)}.dot.warn{background:var(--amber)}.dot.idle{background:var(--dim)}";
+  html += ".pump-btns{display:flex;gap:8px;flex-wrap:wrap}";
+  html += ".btn{padding:10px 18px;border:none;border-radius:8px;font-size:.85rem;font-weight:600;cursor:pointer;transition:all .15s}";
+  html += ".btn:active{transform:scale(.97)}";
+  html += ".btn-on{background:var(--green);color:#fff}.btn-on:hover{opacity:.85}";
+  html += ".btn-off{background:var(--red);color:#fff}.btn-off:hover{opacity:.85}";
+  html += ".btn-auto{background:var(--blue);color:#fff}.btn-auto:hover{opacity:.85}";
+  html += ".btn-sm{padding:6px 14px;font-size:.78rem;background:var(--border);color:var(--text);border-radius:6px;text-decoration:none;display:inline-block}";
+  html += ".btn-sm:hover{opacity:.8}";
+  html += ".mode-tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.75rem;font-weight:600}";
+  html += ".mode-auto{background:#d1fae5;color:#065f46}.mode-manual{background:#fef3c7;color:#92400e}";
+  html += "@media(prefers-color-scheme:dark){.mode-auto{background:#064e3b;color:#6ee7b7}.mode-manual{background:#78350f;color:#fde68a}}";
+  html += ".ts{color:var(--dim);font-size:.75rem;margin-top:8px}";
+  html += "</style></head><body>";
+
+  html += "<h1>Water Tank Controller</h1>";
+  html += "<p class='sub'>v" + String(FIRMWARE_VERSION) + " &middot; <span id='clock'>--</span></p>";
+
+  // Pump Control Card
+  html += "<div class='card'>";
+  html += "<h2><span class='dot' id='d-pump'></span>Pump Control</h2>";
+  html += "<div class='pump-btns'>";
+  html += "<button class='btn btn-on' onclick='pump("on")'>Turn ON</button>";
+  html += "<button class='btn btn-off' onclick='pump("off")'>Turn OFF</button>";
+  html += "<button class='btn btn-auto' onclick='pump("auto")'>Auto Mode</button>";
+  html += "</div>";
+  html += "<p class='ts'>Mode: <span id='mode-tag'></span> &middot; Status: <strong id='pump-status'>--</strong></p>";
+  html += "</div>";
+
+  // System Status Card
+  html += "<div class='card'>";
+  html += "<h2>System Status</h2>";
+  html += "<div class='grid'>";
+  html += "<div class='stat'><span class='label'>WiFi</span><span class='value' id='s-wifi'>--</span></div>";
+  html += "<div class='stat'><span class='label'>MQTT</span><span class='value' id='s-mqtt'>--</span></div>";
+  html += "<div class='stat'><span class='label'>Time Sync</span><span class='value' id='s-time'>--</span></div>";
+  html += "<div class='stat'><span class='label'>RTC</span><span class='value' id='s-rtc'>--</span></div>";
+  html += "<div class='stat'><span class='label'>RTC Battery</span><span class='value' id='s-batt'>--</span></div>";
+  html += "<div class='stat'><span class='label'>Uptime</span><span class='value' id='s-uptime'>--</span></div>";
+  html += "<div class='stat'><span class='label'>WiFi Signal</span><span class='value' id='s-rssi'>--</span></div>";
+  html += "<div class='stat'><span class='label'>IP Address</span><span class='value' id='s-ip'>--</span></div>";
+  html += "</div></div>";
+
+  // Water Level Card
+  html += "<div class='card'>";
+  html += "<h2>Water Level</h2>";
+  html += "<div class='grid'>";
+  html += "<div class='stat'><span class='label'>Low Sensor</span><span class='value' id='s-low'>--</span></div>";
+  html += "<div class='stat'><span class='label'>High Sensor</span><span class='value' id='s-high'>--</span></div>";
+  html += "</div></div>";
+
+  // Pump History Card
+  html += "<div class='card'>";
+  html += "<h2>Pump History</h2>";
+  html += "<div class='grid'>";
+  html += "<div class='stat'><span class='label'>Last ON</span><span class='value' id='h-on'>--</span></div>";
+  html += "<div class='stat'><span class='label'>Last OFF</span><span class='value' id='h-off'>--</span></div>";
+  html += "<div class='stat'><span class='label'>Last Duration</span><span class='value' id='h-dur'>--</span></div>";
+  html += "<div class='stat'><span class='label'>Running</span><span class='value' id='h-run'>--</span></div>";
+  html += "</div></div>";
+
+  // Footer links
+  html += "<div style='display:flex;gap:8px;margin-top:8px;flex-wrap:wrap'>";
+  html += "<a class='btn-sm' href='/setup'>Settings</a>";
+  html += "<a class='btn-sm' href='/update'>OTA Update</a>";
+  html += "<button class='btn-sm' onclick="if(confirm('Restart device?'))fetch('/restart',{method:'POST'})">Restart</button>";
+  html += "</div>";
+
+  // JavaScript - AJAX polling
+  html += "<script>";
+  html += "function fmt(s){if(!s||s<1)return'-';var h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;return h?h+'h '+m+'m':m?m+'m '+ss+'s':ss+'s'}";
+  html += "function fmtDur(ms){if(!ms)return'-';var s=Math.floor(ms/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;return h?h+'h '+m+'m '+ss+'s':m?m+'m '+ss+'s':ss+'s'}";
+  html += "function dot(el,ok){el.className='dot '+(ok?'on':'off')}";
+  html += "function val(el,txt,ok){el.textContent=txt;el.style.color=ok?'var(--green)':ok===false?'var(--red)':'var(--text)'}";
+  html += "function dt(ep){if(!ep||ep<1000000000)return'-';var d=new Date(ep*1000);return d.toLocaleDateString('en-GB',{day:'2-digit',month:'short'})+' '+d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}";
+  html += "function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{";
+  html += "document.getElementById('clock').textContent=dt(d.current_time);";
+  html += "val(document.getElementById('s-wifi'),d.wifi?'Connected':'Disconnected',d.wifi);";
+  html += "val(document.getElementById('s-mqtt'),d.mqtt?'Connected':'Disconnected',d.mqtt);";
+  html += "val(document.getElementById('s-time'),d.time_synced?'NTP Synced':'Not Synced',d.time_synced);";
+  html += "val(document.getElementById('s-rtc'),d.rtc_valid?'Active':'Missing',d.rtc_valid);";
+  html += "val(document.getElementById('s-batt'),d.battery_health,d.battery_health==='good'?true:d.battery_health==='weak'?null:false);";
+  html += "document.getElementById('s-uptime').textContent=fmt(d.uptime);";
+  html += "document.getElementById('s-rssi').textContent=d.rssi+' dBm';";
+  html += "document.getElementById('s-ip').textContent=d.ip;";
+  html += "val(document.getElementById('s-low'),d.low_water?'Active':'Inactive',d.low_water);";
+  html += "val(document.getElementById('s-high'),d.high_water?'Active':'Inactive',d.high_water);";
+  html += "val(document.getElementById('pump-status'),d.pump?'ON':'OFF',d.pump);";
+  html += "dot(document.getElementById('d-pump'),d.pump);";
+  html += "var mt=document.getElementById('mode-tag');mt.textContent=d.override_mode?'Manual':'Automatic';";
+  html += "mt.className='mode-tag '+(d.override_mode?'mode-manual':'mode-auto');";
+  html += "if(d.pump_last_on>0){document.getElementById('h-on').textContent=fmt(Math.floor(d.uptime-d.pump_last_on/1000))+' ago'}else{document.getElementById('h-on').textContent='Never'}";
+  html += "if(d.pump_last_off>0){document.getElementById('h-off').textContent=fmt(Math.floor(d.uptime-d.pump_last_off/1000))+' ago'}else{document.getElementById('h-off').textContent='Never'}";
+  html += "document.getElementById('h-dur').textContent=fmtDur(d.pump_duration);";
+  html += "if(d.pump&&d.pump_last_on>0){var run=Math.floor((Date.now()/1000-d.pump_last_on/1000));document.getElementById('h-run').textContent=fmt(run)}else{document.getElementById('h-run').textContent='--'}";
+  html += "}).catch(()=>{})}";
+  html += "poll();setInterval(poll,3000);";
+  html += "function pump(a){fetch('/pump',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action='+a}).then(()=>setTimeout(poll,300))}";
+  html += "</body></html>";
+
+  return html;
+}
   html += "<style>";
   html += "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }";
   html += "h2 { color: #333; }";
@@ -2044,43 +2432,54 @@ String WebServerHandler::buildStatusPage()
 String WebServerHandler::buildSetupPage()
 {
   String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<title>Configuration</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Settings</title>";
   html += "<style>";
-  html += "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }";
-  html += "form { background-color: white; padding: 20px; max-width: 500px; border-radius: 5px; }";
-  html += "h2 { color: #333; }";
-  html += "label { display: block; margin-top: 10px; font-weight: bold; }";
-  html += "input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; }";
-  html += "input[type='submit'] { background-color: #4CAF50; color: white; border: none; ";
-  html += "padding: 12px; margin-top: 20px; cursor: pointer; border-radius: 4px; }";
-  html += "input[type='submit']:hover { background-color: #45a049; }";
-  html += ".back-link { display: inline-block; margin-top: 20px; }";
+  html += "*{margin:0;padding:0;box-sizing:border-box}";
+  html += ":root{--bg:#f5f7fa;--card:#fff;--text:#1a1a2e;--dim:#6b7280;--border:#e5e7eb;--green:#10b981;--blue:#3b82f6}";
+  html += "@media(prefers-color-scheme:dark){:root{--bg:#0f172a;--card:#1e293b;--text:#e2e8f0;--dim:#94a3b8;--border:#334155}}";
+  html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);padding:16px;max-width:500px;margin:0 auto}";
+  html += "h1{font-size:1.4rem;margin-bottom:16px}";
+  html += ".card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:12px}";
+  html += ".card h2{font-size:.9rem;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px}";
+  html += "label{display:block;font-size:.85rem;font-weight:600;margin-bottom:4px}";
+  html += "input[type=text],input[type=password],input[type=number]{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:8px;font-size:.9rem;background:var(--bg);color:var(--text);margin-bottom:12px}";
+  html += "input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 2px rgba(59,130,246,.2)}";
+  html += ".hint{font-size:.75rem;color:var(--dim);margin-top:-8px;margin-bottom:12px}";
+  html += ".btn{display:block;width:100%;padding:12px;border:none;border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer;margin-top:8px}";
+  html += ".btn-primary{background:var(--green);color:#fff}.btn-primary:hover{opacity:.85}";
+  html += ".btn-back{background:transparent;border:1px solid var(--border);color:var(--text);text-align:center;text-decoration:none;margin-top:12px}";
+  html += ".btn-back:hover{opacity:.7}";
   html += "</style></head><body>";
 
+  html += "<h1>Settings</h1>";
   html += "<form method='POST' action='/save'>";
-  html += "<h2>WiFi Settings</h2>";
-  html += "<label>SSID:</label><input type='text' name='wifi_ssid' value='" + String(settings.wifi_ssid) + "'>";
-  html += "<label>Password:</label><input type='password' name='wifi_password' value='" + String(settings.wifi_password) + "'>";
 
-  html += "<h2>MQTT Settings</h2>";
-  html += "<label>Server:</label><input type='text' name='mqtt_server' value='" + String(settings.mqtt_server) + "'>";
-  html += "<label>Port:</label><input type='number' name='mqtt_port' value='" + String(settings.mqtt_port) + "'>";
-  html += "<label>Username:</label><input type='text' name='mqtt_user' value='" + String(settings.mqtt_user) + "'>";
-  html += "<label>Password:</label><input type='password' name='mqtt_password' value='" + String(settings.mqtt_password) + "'>";
+  html += "<div class='card'>";
+  html += "<h2>WiFi</h2>";
+  html += "<label>SSID</label><input type='text' name='wifi_ssid' value='" + String(settings.wifi_ssid) + "'>";
+  html += "<label>Password</label><input type='password' name='wifi_password' value='" + String(settings.wifi_password) + "'>";
+  html += "</div>";
 
-  html += "<h2>OTA Settings</h2>";
-  html += "<label>OTA Password:</label><input type='password' name='ota_password' value='" + String(settings.ota_password) + "'>";
+  html += "<div class='card'>";
+  html += "<h2>MQTT</h2>";
+  html += "<label>Server</label><input type='text' name='mqtt_server' value='" + String(settings.mqtt_server) + "'>";
+  html += "<label>Port</label><input type='number' name='mqtt_port' value='" + String(settings.mqtt_port) + "'>";
+  html += "<label>Username</label><input type='text' name='mqtt_user' value='" + String(settings.mqtt_user) + "'>";
+  html += "<label>Password</label><input type='password' name='mqtt_password' value='" + String(settings.mqtt_password) + "'>";
+  html += "</div>";
 
-  html += "<h2>Time Settings</h2>";
-  html += "<label>Timezone Offset (hours from UTC):</label>";
+  html += "<div class='card'>";
+  html += "<h2>System</h2>";
+  html += "<label>OTA Password</label><input type='password' name='ota_password' value='" + String(settings.ota_password) + "'>";
+  html += "<label>Timezone (hours from UTC)</label>";
   html += "<input type='number' name='timezone_offset' min='-12' max='14' value='" + String(settings.timezone_offset) + "'>";
-  html += "<small style='display: block; margin-top: 5px; color: #666;'>Examples: +7 for GMT+7 (Bangkok), -5 for EST, +0 for UTC</small>";
+  html += "<div class='hint'>+7 for GMT+7 (WIB), -5 for EST, +0 for UTC</div>";
+  html += "</div>";
 
-  html += "<input type='submit' value='Save Settings'>";
+  html += "<button class='btn btn-primary' type='submit'>Save Settings</button>";
   html += "</form>";
-
-  html += "<a href='/' class='back-link'>Back to Status</a>";
+  html += "<a class='btn btn-back' href='/'>Back to Status</a>";
   html += "</body></html>";
 
   return html;
