@@ -2132,9 +2132,9 @@ String WebServerHandler::buildStatusPage()
   html += "<div class='card'>";
   html += "<h2><span class='dot' id='d-pump'></span>Pump Control</h2>";
   html += "<div class='pump-btns'>";
-  html += "<button class='btn btn-on' onclick='pump("on")'>Turn ON</button>";
-  html += "<button class='btn btn-off' onclick='pump("off")'>Turn OFF</button>";
-  html += "<button class='btn btn-auto' onclick='pump("auto")'>Auto Mode</button>";
+  html += "<button class='btn btn-on' onclick='pump(\"on\")'>Turn ON</button>";
+  html += "<button class='btn btn-off' onclick='pump(\"off\")'>Turn OFF</button>";
+  html += "<button class='btn btn-auto' onclick='pump(\"auto\")'>Auto Mode</button>";
   html += "</div>";
   html += "<p class='ts'>Mode: <span id='mode-tag'></span> &middot; Status: <strong id='pump-status'>--</strong></p>";
   html += "</div>";
@@ -2175,7 +2175,7 @@ String WebServerHandler::buildStatusPage()
   html += "<div style='display:flex;gap:8px;margin-top:8px;flex-wrap:wrap'>";
   html += "<a class='btn-sm' href='/setup'>Settings</a>";
   html += "<a class='btn-sm' href='/update'>OTA Update</a>";
-  html += "<button class='btn-sm' onclick="if(confirm('Restart device?'))fetch('/restart',{method:'POST'})">Restart</button>";
+  html += "<button class='btn-sm' onclick=\"if(confirm('Restart device?'))fetch('/restart',{method:'POST'})\">Restart</button>";
   html += "</div>";
 
   // JavaScript - AJAX polling
@@ -2208,222 +2208,6 @@ String WebServerHandler::buildStatusPage()
   html += "}).catch(()=>{})}";
   html += "poll();setInterval(poll,3000);";
   html += "function pump(a){fetch('/pump',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action='+a}).then(()=>setTimeout(poll,300))}";
-  html += "</body></html>";
-
-  return html;
-}
-  html += "<style>";
-  html += "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }";
-  html += "h2 { color: #333; }";
-  html += ".container { display: flex; flex-wrap: wrap; gap: 20px; }";
-  html += "table { border-collapse: collapse; width: 100%; max-width: 600px; background-color: white; }";
-  html += "th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }";
-  html += "th { background-color: #4CAF50; color: white; }";
-  html += "tr:nth-child(even) { background-color: #f2f2f2; }";
-  html += ".status-on { color: green; font-weight: bold; }";
-  html += ".status-off { color: red; font-weight: bold; }";
-  html += ".status-warning { color: orange; font-weight: bold; }";
-  html += ".button { display: inline-block; padding: 10px 20px; margin: 10px 5px; ";
-  html += "background-color: #4CAF50; color: white; text-decoration: none; border-radius: 4px; border: none; cursor: pointer; }";
-  html += ".button:hover { background-color: #45a049; }";
-  html += ".button-danger { background-color: #f44336; }";
-  html += ".button-danger:hover { background-color: #da190b; }";
-  html += ".button-warning { background-color: #ff9800; }";
-  html += ".button-warning:hover { background-color: #e68900; }";
-  html += ".control-panel { background-color: white; padding: 20px; border-radius: 5px; margin: 20px 0; max-width: 600px; }";
-  html += ".control-panel h3 { margin-top: 0; color: #333; }";
-  html += ".control-buttons { display: flex; gap: 10px; flex-wrap: wrap; }";
-  html += ".table-wrapper { flex: 1; min-width: 300px; }";
-  html += "@media (max-width: 768px) { .container { flex-direction: column; } }";
-  html += "</style>";
-  html += "<script>";
-  html += "var refreshTimer;";
-  html += "function autoRefresh() { refreshTimer = setTimeout(function(){ location.reload(); }, 5000); }";
-  html += "function stopRefresh() { clearTimeout(refreshTimer); }";
-  html += "function confirmRestart() {";
-  html += "  return confirm('Are you sure you want to restart the device?\\n\\nThe web interface will be unavailable for about 30 seconds.\\n\\nClick OK to restart or Cancel to continue.');";
-  html += "}";
-  html += "window.onload = autoRefresh;";
-  html += "</script>";
-  html += "</head><body>";
-
-  html += "<h2>Water Tank Controller Status</h2>";
-  html += "<p style='color: #666; font-size: 14px;'>Firmware Version: <strong>" + String(FIRMWARE_VERSION) + "</strong></p>";
-
-  // Pump Control Panel
-  html += "<div class='control-panel'>";
-  html += "<h3>Pump Control</h3>";
-  html += "<div class='control-buttons'>";
-  html += "<form method='POST' action='/pump' style='display: inline;'>";
-  html += "<input type='hidden' name='action' value='on'>";
-  html += "<button type='submit' class='button button-danger' onclick='stopRefresh()'>Turn Pump ON</button>";
-  html += "</form>";
-  html += "<form method='POST' action='/pump' style='display: inline;'>";
-  html += "<input type='hidden' name='action' value='off'>";
-  html += "<button type='submit' class='button button-danger' onclick='stopRefresh()'>Turn Pump OFF</button>";
-  html += "</form>";
-  html += "<form method='POST' action='/pump' style='display: inline;'>";
-  html += "<input type='hidden' name='action' value='auto'>";
-  html += "<button type='submit' class='button button-warning' onclick='stopRefresh()'>Auto Mode</button>";
-  html += "</form>";
-  html += "</div>";
-  html += "<p style='font-size: 12px; color: #666; margin-top: 10px;'>";
-  html += "Current Mode: <strong>" + String(pumpController.isOverrideMode() ? "Manual Override" : "Automatic") + "</strong> | ";
-  html += "Pump Status: <strong class='" + String(pumpController.getPumpState() ? "status-on" : "status-off") + "'>";
-  html += pumpController.getPumpState() ? "ON" : "OFF";
-  html += "</strong></p>";
-  html += "</div>";
-
-  // Time Sync Control
-  html += "<div class='control-panel'>";
-  html += "<h3>Time Sync Control</h3>";
-  html += "<div class='control-buttons'>";
-  html += "<form method='POST' action='/timesync' style='display: inline;'>";
-  html += "<button type='submit' class='button' onclick='stopRefresh()'>Force Time Sync</button>";
-  html += "</form>";
-  html += "</div>";
-  html += "<p style='font-size: 12px; color: #666; margin-top: 10px;'>";
-  html += "Attempts to sync time with NTP servers. Works only when WiFi is connected.";
-  html += "</p>";
-  html += "</div>";
-
-  // Device Control
-  html += "<div class='control-panel'>";
-  html += "<h3>Device Control</h3>";
-  html += "<div class='control-buttons'>";
-  html += "<form method='POST' action='/restart' style='display: inline;' onsubmit='return confirmRestart();'>";
-  html += "<button type='submit' class='button button-danger' onclick='stopRefresh()'>Restart Device</button>";
-  html += "</form>";
-  html += "</div>";
-  html += "<p style='font-size: 12px; color: #666; margin-top: 10px;'>";
-  html += "⚠️ Restarts the ESP8266 device. Web interface will be unavailable for ~30 seconds.";
-  html += "</p>";
-  html += "</div>";
-
-  html += "<div class='container'>";
-
-  // General Status Table
-  html += "<div class='table-wrapper'>";
-  html += "<h3>General Status</h3>";
-  html += "<table>";
-  html += "<tr><th>Item</th><th>Status</th></tr>";
-
-  // WiFi status
-  html += "<tr><td>WiFi</td><td class='";
-  html += systemManager.isWiFiConnected() ? "status-on'>Connected" : "status-off'>Disconnected";
-  html += "</td></tr>";
-
-  if (systemManager.isWiFiConnected())
-  {
-    html += "<tr><td>IP Address</td><td>" + systemManager.getIPAddress() + "</td></tr>";
-  }
-
-  // Time sync status
-  html += "<tr><td>Time Sync</td><td class='";
-  if (systemManager.isTimeSynced())
-  {
-    html += "status-on'>NTP Synced";
-  }
-  else
-  {
-    time_t currentTime = systemManager.getCurrentTime();
-    if (currentTime > 1000000000)
-    {
-      html += "status-warning'>Compensated";
-    }
-    else
-    {
-      html += "status-off'>Not Synced";
-    }
-  }
-  html += "</td></tr>";
-
-  // MQTT status
-  html += "<tr><td>MQTT</td><td class='";
-  html += mqttClient.isConnected() ? "status-on'>Connected" : "status-off'>Disconnected";
-  html += "</td></tr>";
-
-  // Water level sensors
-  html += "<tr><td>Low Water Sensor</td><td class='";
-  html += waterLevel.isLowWaterDetected() ? "status-on'>Active" : "status-off'>Inactive";
-  html += "</td></tr>";
-
-  html += "<tr><td>High Water Sensor</td><td class='";
-  html += waterLevel.isHighWaterDetected() ? "status-on'>Active" : "status-off'>Inactive";
-  html += "</td></tr>";
-
-  // Pump status
-  html += "<tr><td>Pump</td><td class='";
-  html += pumpController.getPumpState() ? "status-on'>ON" : "status-off'>OFF";
-  html += "</td></tr>";
-
-  // Control mode
-  html += "<tr><td>Control Mode</td><td>";
-  html += pumpController.isOverrideMode() ? "Manual Override" : "Automatic";
-  html += "</td></tr>";
-
-  // Uptime
-  unsigned long uptime = millis() / 1000;
-  unsigned long hours = uptime / 3600;
-  unsigned long minutes = (uptime % 3600) / 60;
-  unsigned long seconds = uptime % 60;
-  html += "<tr><td>Uptime</td><td>" + String(hours) + "h " + String(minutes) + "m " + String(seconds) + "s</td></tr>";
-
-  html += "</table>";
-  html += "</div>";
-
-  // Pump Timing Table
-  html += "<div class='table-wrapper'>";
-  html += "<h3>Pump Timing</h3>";
-  html += "<table>";
-  html += "<tr><th>Event</th><th>Time</th></tr>";
-
-  // Last pump ON
-  html += "<tr><td>Last Pump ON</td><td>";
-  html += formatDuration(pumpController.getLastOnTime());
-  html += "</td></tr>";
-
-  // Last pump ON timestamp
-  html += "<tr><td>Last ON Timestamp</td><td>";
-  html += formatDateTime(pumpController.getLastOnEpoch());
-  html += "</td></tr>";
-
-  // Last pump OFF
-  html += "<tr><td>Last Pump OFF</td><td>";
-  html += formatDuration(pumpController.getLastOffTime());
-  html += "</td></tr>";
-
-  // Last pump OFF timestamp
-  html += "<tr><td>Last OFF Timestamp</td><td>";
-  html += formatDateTime(pumpController.getLastOffEpoch());
-  html += "</td></tr>";
-
-  // Last pump duration (from last ON to OFF)
-  html += "<tr><td>Last Pump Duration</td><td>";
-  html += formatPumpDuration(pumpController.getLastPumpDuration());
-  html += "</td></tr>";
-
-  // Calculate pump running duration if currently ON
-  if (pumpController.getPumpState() && pumpController.getLastOnTime() > 0)
-  {
-    unsigned long runDuration = (millis() - pumpController.getLastOnTime()) / 1000;
-    unsigned long runHours = runDuration / 3600;
-    unsigned long runMinutes = (runDuration % 3600) / 60;
-    unsigned long runSeconds = runDuration % 60;
-    html += "<tr><td>Current Run Duration</td><td>";
-    html += String(runHours) + "h " + String(runMinutes) + "m " + String(runSeconds) + "s";
-    html += "</td></tr>";
-  }
-
-  html += "</table>";
-  html += "</div>";
-
-  html += "</div>";
-
-  html += "<br><a href='/setup' class='button' onclick='stopRefresh()'>Configure Settings</a>";
-  html += "<a href='/update' class='button' onclick='stopRefresh()'>OTA Update</a>";
-
-  html += "<p style='font-size: 12px; color: #666;'>Auto-refresh every 5 seconds (stops when clicking buttons)</p>";
   html += "</body></html>";
 
   return html;
